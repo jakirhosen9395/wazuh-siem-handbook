@@ -121,6 +121,17 @@ sudo systemctl enable wazuh-agent
 sudo systemctl start wazuh-agent
 ```
 
+### 2.4 Verify Agent Registration in the Dashboard
+
+Once the agent service is running, confirm it has registered successfully and is reporting to the manager by checking the **Endpoints Summary** page in the Wazuh dashboard:
+
+```
+https://192.168.56.102/app/endpoints-summary#/agents?tab=welcome&agent=001
+```
+
+![Agent summary and welcome overview](./sshd.png)
+*Agent `001` welcome/summary view — confirms the agent is enrolled, active, and reporting data to the manager.*
+
 ---
 
 ## 3. File Integrity Monitoring (FIM) Configuration
@@ -164,6 +175,20 @@ sudo systemctl status wazuh-agent
 ```
 
 Confirm the service is **active (running)** with no errors in the status output.
+
+### 3.3 FIM Dashboard Views
+
+Once FIM is active, the Wazuh dashboard provides both a high-level overview and a detailed event log of file system changes.
+
+**Overview — created / modified / deleted event counts:**
+
+![File Integrity Monitoring overview](./file-integrity-monitoring.png)
+*Graphical summary showing the total count of file create, modify, and delete events detected by syscheck.*
+
+**Detailed event log:**
+
+![File system events monitoring](./file_system_events_monitoring.png)
+*Itemized list of individual file system events (created, modified, deleted) captured under the monitored directories (`/etc`, `/home`, `/opt`).*
 
 ---
 
