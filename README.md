@@ -24,22 +24,12 @@ This repo documents a hands-on Wazuh lab setup — useful for DevOps/DevSecOps e
 
 ```
 wazuh-siem-handbook/
-├── README.md                          # you are here
-├── docs/
-│   ├── 01-server-setup.md             # manager installation & full logging
-│   ├── 02-agent-installation.md       # agent enrollment
-│   ├── 03-fim-configuration.md        # file integrity monitoring setup
-│   ├── 04-active-response.md          # (planned)
-│   ├── 05-custom-rules.md             # (planned)
-│   └── troubleshooting.md             # (planned)
-├── images/
-│   ├── sshd.png
-│   ├── file-integrity-monitoring.png
-│   └── file_system_events_monitoring.png
-├── configs/
-│   ├── ossec.conf.manager.sample
-│   └── ossec.conf.agent.sample
-└── LICENSE
+├── docs
+│   ├── file-integrity-monitoring.png
+│   ├── file_system_events_monitoring.png
+│   ├── README.md
+│   └── sshd.png
+└── README.md
 ```
 
 ---
