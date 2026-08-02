@@ -61,15 +61,15 @@ wazuh-siem-handbook/
 
 **Agent registration confirmed in the dashboard:**
 
-![Agent summary](./images/sshd.png)
+![Agent summary](./docs/sshd.png)
 
 **File Integrity Monitoring — overview:**
 
-![FIM overview](./images/file-integrity-monitoring.png)
+![FIM overview](./docs/file-integrity-monitoring.png)
 
 **File Integrity Monitoring — event details:**
 
-![FIM events](./images/file_system_events_monitoring.png)
+![FIM events](./docs/file_system_events_monitoring.png)
 
 ---
 
