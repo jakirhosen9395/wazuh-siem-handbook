@@ -2977,111 +2977,340 @@ ps aux | grep wazuh-integratord
 
 ---
 
-## 8. Phase 7: End-to-End Testing and Validation
+## Section 8: Phase 7 – End-to-End Testing and Validation
 
-### Pre-Test Health Verification
+This phase validates the Wazuh deployment using realistic manual testing. Rather than injecting artificial log messages, these tests use real network connections from separate Linux testing machines to confirm that the Wazuh Agent successfully captures raw OS events, the Manager correctly decodes and correlates them, and the Custom HTML Email integration reliably delivers alerts.
+
+### Pre-Test Safety and Environment Setup
+
+**Important:** Do not perform brute-force testing against production accounts to avoid accidental PAM lockouts. Create a dedicated test account on the monitored Wazuh Agent.
+
+**On the Monitored Agent (`vnc-server`):**
+
 ```bash
-# Execute on Wazuh Manager:
-sudo systemctl status wazuh-manager --no-pager
-sudo journalctl -u wazuh-manager -n 100 --no-pager
+# Create a dedicated testing account
+sudo useradd wazuh-tester
+sudo passwd wazuh-tester  # Set a known, temporary password
 
-# Execute on Wazuh Agent:
-sudo systemctl status wazuh-agent --no-pager
-sudo journalctl -u wazuh-agent -n 100 --no-pager
+# Ensure SFTP testing is permitted for this user (if using the groups from earlier phases)
+sudo usermod -aG sftp-allowed wazuh-tester
+
 ```
 
-### Test Case 1: Five Failed SSH Login Attempts Within 5 Minutes (Rule `100601`)
-#### Dry-Run Command (`wazuh-server`):
-```bash
-sudo /var/ossec/bin/wazuh-logtest << 'EOF'
-Nov  6 10:00:01 vnc-server sshd[40101]: Failed password for eng-001 from 11.11.2.99 port 51001 ssh2
-Nov  6 10:00:05 vnc-server sshd[40102]: Failed password for eng-001 from 11.11.2.99 port 51002 ssh2
-Nov  6 10:00:10 vnc-server sshd[40103]: Failed password for eng-001 from 11.11.2.99 port 51003 ssh2
-Nov  6 10:00:15 vnc-server sshd[40104]: Failed password for eng-001 from 11.11.2.99 port 51004 ssh2
-Nov  6 10:00:20 vnc-server sshd[40105]: Failed password for eng-001 from 11.11.2.99 port 51005 ssh2
-EOF
-```
-#### Live End-to-End Command (`vnc-server`):
-```bash
-for i in {1..5}; do
-  sudo logger -p authpriv.info -t "sshd[4010$i]" "Failed password for eng-001 from 11.11.2.99 port 5100$i ssh2"
-  sleep 1
-done
-```
-* **Expected Result:** Events 1–4 match `5716` (`Level 5`, no email). Event 5 triggers **Rule `100601`** (`Level 12`) and sends one `[HIGH PRIORITY]` HTML email.
+---
 
-### Test Case 2: Successful SSH Login From One Internal IP (Built-In Rule `5715`)
-#### Live Command (`vnc-server`):
-```bash
-sudo logger -p authpriv.info -t "sshd[40201]" "Accepted password for eng-001 from 11.11.2.50 port 52001 ssh2"
-```
-* **Expected Result:** Matches Rule `5715` (`Level 3`), indexed in Wazuh Dashboard without sending email noise.
+### Test 1: SSH Brute-Force Detection (5 Failed Attempts)
 
-### Test Case 3: Same Username Logged In From 2 Different IP Addresses Within 5 Minutes (Rule `100603`)
-#### Dry-Run Command (`wazuh-server`):
-```bash
-sudo /var/ossec/bin/wazuh-logtest << 'EOF'
-Nov  6 10:05:01 vnc-server sshd[40301]: Accepted password for eng-001 from 11.11.2.50 port 53001 ssh2
-Nov  6 10:06:10 vnc-server sshd[40302]: Accepted password for eng-001 from 11.11.2.88 port 53002 ssh2
-EOF
-```
-#### Live End-to-End Command (`vnc-server`):
-```bash
-sudo logger -p authpriv.info -t "sshd[40301]" "Accepted password for eng-001 from 11.11.2.50 port 53001 ssh2"
-sleep 2
-sudo logger -p authpriv.info -t "sshd[40302]" "Accepted password for eng-001 from 11.11.2.88 port 53002 ssh2"
-```
-* **Expected Result:** Triggers **Rule `100603`** (`Level 11`) and sends `[HIGH PRIORITY] Suspicious Concurrent SSH Access: User eng-001 logged in from multiple different IP addresses within 5 minutes`.
+**A. Test Objective**
+Validate that 5 failed SSH authentication attempts from a single IP within 5 minutes trigger a brute-force alert.
 
-### Test Case 4: Multiple Distinct Usernames Targeted From One IP (Rule `100604`)
-#### Live End-to-End Command (`vnc-server`):
-```bash
-for u in eng-001 eng-002 eng-003 eng-004; do
-  sudo logger -p authpriv.info -t "sshd[40401]" "Failed password for invalid user $u from 11.11.2.150 port 54001 ssh2"
-  sleep 1
-done
-```
-* **Expected Result:** Triggers **Rule `100604`** (`Level 12`) and sends `[HIGH PRIORITY] SSH Username Enumeration / Spraying Detected`.
+**B. Test Environment**
 
-### Test Case 5: Direct Root SSH Login (Rule `100606`)
-#### Live End-to-End Command (`vnc-server`):
-```bash
-sudo logger -p authpriv.info -t "sshd[40501]" "Accepted publickey for root from 11.11.2.50 port 55001 ssh2"
-```
-* **Expected Result:** Triggers **Rule `100606`** (`Level 12`) and sends `[HIGH PRIORITY] Direct Root SSH Login Succeeded`.
+* **Testing Machine:** A separate Linux workstation/server (e.g., IP: `192.168.1.100`).
+* **Target Agent:** `vnc-server` (`11.11.2.213`).
+* **Test Username:** `wazuh-tester`.
 
-### Test Case 6: Successful SSH Login Immediately Following Brute-Force Attack (Rule `100605`)
-#### Live End-to-End Command (`vnc-server`):
-```bash
-for i in {1..5}; do
-  sudo logger -p authpriv.info -t "sshd[4060$i]" "Failed password for eng-002 from 11.11.2.200 port 5600$i ssh2"
-  sleep 1
-done
-sudo logger -p authpriv.info -t "sshd[40606]" "Accepted password for eng-002 from 11.11.2.200 port 56006 ssh2"
-```
-* **Expected Result:** Triggers **Rule `100601`** (`Level 12`) followed immediately by **Rule `100605`** (`Level 14`) and sends a `[CRITICAL PRIORITY]` red-banner HTML email.
+**C. Manual Testing Instructions**
+From your testing machine, execute the SSH command 5 times rapidly. Each time you are prompted for a password, enter an intentionally *incorrect* password.
 
-### Test Case 7: SFTP File Upload Alert (Rule `100502`)
-#### Live End-to-End Command (`vnc-server`):
 ```bash
-sudo logger -p authpriv.info -t sftp-server 'open "/home/ec2-user/test_chip_layout.gds" flags WRITE,CREATE,TRUNCATE mode 0664'
-```
-* **Expected Result:** Triggers **Rule `100502`** (`Level 12`) and sends `[HIGH PRIORITY] SFTP File Upload/Write Detected`.
+ssh wazuh-tester@11.11.2.213
+# Type a fake password, press Enter. Wait for "Permission denied". Repeat 4 more times.
 
-### Test Case 8: Suspicious New Listening Port Opened (Rule `100620`)
-#### Live End-to-End Command (`vnc-server`):
-```bash
-python3 -m http.server 9999 --bind 127.0.0.1 >/dev/null 2>&1 &
-TEST_PID=$!
-sleep 65
-kill $TEST_PID
 ```
-* **Expected Result:** Within 60 seconds, triggers **Rule `100620`** (`Level 10`) and sends an HTML email showing the new listening socket `tcp 127.0.0.1:9999`.
 
-### Verify Alerts and Email Delivery on `wazuh-server`
+**D. Expected Result**
+
+* **Triggered Rule:** `100601` (Level 12).
+* **Alert Information:** "SSH Brute-Force Attack Detected: 5 failed login attempts within 5 minutes..."
+* **Email Action:** A high-priority HTML email is generated and sent to the configured recipient containing the attacker's IP and targeted user.
+
+**E. Verification on Wazuh Manager**
+Log into the Wazuh Manager and verify the alert and email dispatch:
+
 ```bash
-sudo tail -n 30 /var/ossec/logs/alerts/alerts.json | grep -E "10050|10060|10062"
-sudo tail -n 25 /var/log/maillog
+sudo grep "100601" /var/ossec/logs/alerts/alerts.log
+sudo grep "wazuh-tester" /var/log/maillog
+
+```
+
+---
+
+### Test 2: Successful SSH Login
+
+**A. Test Objective**
+Validate that a standard successful SSH authentication is logged accurately without triggering a brute-force or high-severity alert.
+
+**B. Test Environment**
+
+* **Testing Machine:** A single authorized Linux workstation.
+* **Target Agent:** `vnc-server` (`11.11.2.213`).
+* **Test Username:** `wazuh-tester`.
+
+**C. Manual Testing Instructions**
+From your testing machine, authenticate successfully:
+
+```bash
+ssh wazuh-tester@11.11.2.213
+# Enter the correct password to access the shell.
+# Type 'exit' to close the session.
+
+```
+
+**D. Expected Result**
+
+* **Triggered Rule:** Built-in Rule `5715` (Level 3).
+* **Alert Information:** "sshd: authentication success."
+* **Email Action:** No email should be sent (level is below the default email threshold and no explicit email option is attached).
+
+**E. Verification on Wazuh Manager**
+
+```bash
+sudo grep "5715" /var/ossec/logs/alerts/alerts.log | grep "wazuh-tester"
+
+```
+
+---
+
+### Test 3: Same Username Accessed from Multiple IP Addresses
+
+**A. Test Objective**
+Verify detection of a suspicious scenario where the same user account successfully authenticates from two genuinely distinct network locations within 5 minutes.
+
+**B. Test Environment**
+
+* **Testing Machines:** *Machine A* (e.g., `192.168.1.100`) and *Machine B* (e.g., `10.0.5.50`). You must use two distinct network interfaces or servers.
+* **Target Agent:** `vnc-server` (`11.11.2.213`).
+* **Test Username:** `wazuh-tester`.
+
+**C. Manual Testing Instructions**
+
+1. From **Machine A**, log in successfully:
+```bash
+ssh wazuh-tester@11.11.2.213
+
+```
+
+
+2. Within 5 minutes, from **Machine B**, log in successfully:
+```bash
+ssh wazuh-tester@11.11.2.213
+
+```
+
+
+
+**D. Expected Result**
+
+* **Triggered Rule:** `100603` (Level 11).
+* **Alert Information:** "Suspicious Concurrent SSH Access: User wazuh-tester logged in from multiple different IP addresses..."
+* **Email Action:** An HTML email notification is sent outlining both the target user and the latest source IP.
+
+**E. Verification on Wazuh Manager**
+
+```bash
+sudo grep "100603" /var/ossec/logs/alerts/alerts.log
+
+```
+
+---
+
+### Test 4: Username Enumeration / Spraying
+
+**A. Test Objective**
+Detect a single source IP attempting to log in across multiple non-existent or varying usernames (spraying) within 5 minutes.
+
+**B. Test Environment**
+
+* **Testing Machine:** A single Linux workstation.
+* **Target Agent:** `vnc-server` (`11.11.2.213`).
+* **Test Usernames:** `fakeuser1`, `fakeuser2`, `fakeuser3`, `fakeuser4`.
+
+**C. Manual Testing Instructions**
+From the testing machine, attempt SSH access sequentially using different invalid usernames. Provide a fake password for each.
+
+```bash
+ssh fakeuser1@11.11.2.213
+ssh fakeuser2@11.11.2.213
+ssh fakeuser3@11.11.2.213
+ssh fakeuser4@11.11.2.213
+
+```
+
+**D. Expected Result**
+
+* **Triggered Rule:** `100604` (Level 12).
+* **Alert Information:** "SSH Username Enumeration / Spraying Detected: Source IP failed authentication against multiple distinct usernames..."
+* **Email Action:** An HTML email is dispatched highlighting the attacking IP.
+
+**E. Verification on Wazuh Manager**
+
+```bash
+sudo grep "100604" /var/ossec/logs/alerts/alerts.log
+
+```
+
+---
+
+### Test 5: Direct Root SSH Login
+
+**A. Test Objective**
+Validate that any successful direct authentication as the `root` user is flagged immediately.
+
+**B. Test Environment**
+
+* **Testing Machine:** A single Linux workstation.
+* **Target Agent:** `vnc-server` (`11.11.2.213`).
+* **Prerequisite:** Temporarily set `PermitRootLogin yes` in `/etc/ssh/sshd_config` on the Agent and reload `sshd` to allow the test to succeed.
+
+**C. Manual Testing Instructions**
+From the testing machine, authenticate as `root`:
+
+```bash
+ssh root@11.11.2.213
+# Enter the root password.
+# Immediately log out and revert PermitRootLogin if prohibited by policy.
+
+```
+
+**D. Expected Result**
+
+* **Triggered Rule:** `100606` (Level 12).
+* **Alert Information:** "Direct Root SSH Login Succeeded from IP..."
+* **Email Action:** A critical HTML email notification is generated.
+
+**E. Verification on Wazuh Manager**
+
+```bash
+sudo grep "100606" /var/ossec/logs/alerts/alerts.log
+
+```
+
+---
+
+### Test 6: Successful Login Following Repeated Failures
+
+**A. Test Objective**
+Detect a high-risk compromise indicator: an attacker successfully guessing a password immediately after a brute-force attack.
+
+**B. Test Environment**
+
+* **Testing Machine:** A single Linux workstation.
+* **Target Agent:** `vnc-server` (`11.11.2.213`).
+* **Test Username:** `wazuh-tester`.
+
+**C. Manual Testing Instructions**
+
+1. From the testing machine, trigger the brute-force rule by attempting 5 SSH connections with an incorrect password.
+2. On the 6th attempt (within the same 5-minute window), authenticate using the *correct* password.
+
+```bash
+# 5 times with bad password:
+ssh wazuh-tester@11.11.2.213
+# 1 time with good password:
+ssh wazuh-tester@11.11.2.213
+
+```
+
+**D. Expected Result**
+
+* **Triggered Rule:** `100605` (Level 14).
+* **Alert Information:** "CRITICAL: Successful SSH login... immediately following an SSH brute-force attack."
+* **Email Action:** A critical severity HTML email is dispatched immediately.
+
+**E. Verification on Wazuh Manager**
+
+```bash
+sudo grep "100605" /var/ossec/logs/alerts/alerts.log
+
+```
+
+---
+
+### Test 7: SFTP File Upload Alert
+
+**A. Test Objective**
+Ensure `internal-sftp` subsystem logging correctly decodes and triggers alerts for file uploads.
+
+**B. Test Environment**
+
+* **Testing Machine:** A single Linux workstation.
+* **Target Agent:** `vnc-server` (`11.11.2.213`).
+* **Test Username:** `wazuh-tester`.
+
+**C. Manual Testing Instructions**
+Create a dummy file on your testing machine and upload it via SFTP:
+
+```bash
+echo "Malicious payload test" > sftp-test.txt
+sftp wazuh-tester@11.11.2.213
+# At the sftp> prompt:
+sftp> put sftp-test.txt
+sftp> exit
+
+```
+
+**D. Expected Result**
+
+* **Triggered Rule:** `100502` (Level 12).
+* **Alert Information:** "SFTP File Upload/Write Detected: File 'sftp-test.txt' opened..."
+* **Email Action:** An HTML email is dispatched identifying the uploaded file and user.
+
+**E. Verification on Wazuh Manager**
+
+```bash
+sudo grep "100502" /var/ossec/logs/alerts/alerts.log
+
+```
+
+---
+
+### Test 8: Suspicious New Listening Port Detection
+
+**A. Test Objective**
+Validate that Wazuh detects rogue services opening new TCP/UDP listening ports on the monitored agent.
+
+**B. Test Environment**
+
+* **Testing Machine:** The Wazuh Agent itself (`vnc-server`).
+* **Prerequisite:** `nc` (netcat) or `python3` installed.
+
+**C. Manual Testing Instructions**
+Log into the Agent locally or via SSH and open a temporary, unauthorized listening port (e.g., 9999).
+
+```bash
+# Option A: using netcat
+nc -l -p 9999
+
+# Option B: using python3
+python3 -m http.server 9999
+
+```
+
+Leave the terminal open and running. Wazuh polls the `netstat` / `ss` output command every 60 seconds (per `localfile` configuration). Wait up to 2 minutes.
+
+**D. Expected Result**
+
+* **Triggered Rule:** `100620` (Level 10).
+* **Alert Information:** "Network Port Change Detected: Active TCP/UDP listening sockets changed on server."
+* **Email Action:** An HTML email is dispatched showing the output differential (the new port 9999).
+
+**E. Verification on Wazuh Manager**
+
+```bash
+sudo grep "100620" /var/ossec/logs/alerts/alerts.log
+
+```
+
+### Post-Test Cleanup
+
+Once validation is complete, securely remove the test account from the Agent server to prevent unauthorized access.
+**On the Monitored Agent (`vnc-server`):**
+
+```bash
+# Kill the listening port process (Ctrl+C in the terminal or kill by PID)
+sudo userdel -r wazuh-tester
+
 ```
 
 ---
