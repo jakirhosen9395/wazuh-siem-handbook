@@ -8,8 +8,8 @@ This runbook documents the complete end-to-end deployment of **Wazuh v4.14.9** (
 
 | Feature / Component | Status | Notes |
 | :--- | :--- | :--- |
-| **Wazuh All-in-One Server (v4.14.9)** | **Completed** | Deployed on RHEL 9.8 (`<WAZUH_SERVER_IP>`) with 99 GB root disk and 4 GB Swap. |
-| **Wazuh Agent (`vnc-server` v4.14.9)** | **Completed** | Installed via standalone RPM and enrolled with `<WAZUH_SERVER_IP>`. |
+| **Wazuh All-in-One Server (v4.14.9)** | **Completed** | Deployed on RHEL 9.8 (`11.11.2.7`) with 99 GB root disk and 4 GB Swap. |
+| **Wazuh Agent (`vnc-server` v4.14.9)** | **Completed** | Installed via standalone RPM and enrolled with `11.11.2.7`. |
 | **Kernel `auditd` Command & User Tracking** | **Completed** | Tracks all `execve` commands (`auid >= 1000`), `/etc/passwd`, `/etc/shadow`, and `/etc/tigervnc`. |
 | **Real-Time FIM (`whodata="yes"`)** | **Completed** | Monitors `/etc`, `/usr/bin`, `/usr/sbin`, `/boot`, `/home`, and `/root` with real-time kernel events. |
 | **OpenSSH / SFTP Access & Verbose Logging** | **Completed** | Configured `internal-sftp -f AUTHPRIV -l INFO` and `sftp-allowed` / `sftp-denied` match groups. |
@@ -26,8 +26,8 @@ This runbook documents the complete end-to-end deployment of **Wazuh v4.14.9** (
 
 | Role | Hostname | IP Placeholder | OS Version | Installed Services / Daemons |
 | :--- | :--- | :--- | :--- | :--- |
-| **Wazuh All-in-One Server** | `wazuh-server` | `<WAZUH_SERVER_IP>` | RHEL 9.8 (`x86_64`) | `wazuh-indexer` (OpenSearch 2.19.6), `wazuh-manager` (v4.14.9), `filebeat` (v7.10.2), `wazuh-dashboard` (v4.14.9), `postfix`, `auditd` |
-| **Monitored Agent Server** | `vnc-server` | `<AGENT_SERVER_IP>` | RHEL 9.8 (`x86_64`) | `wazuh-agent` (v4.14.9), `auditd`, `sshd` (`internal-sftp`) |
+| **Wazuh All-in-One Server** | `wazuh-server` | `11.11.2.7` | RHEL 9.8 (`x86_64`) | `wazuh-indexer` (OpenSearch 2.19.6), `wazuh-manager` (v4.14.9), `filebeat` (v7.10.2), `wazuh-dashboard` (v4.14.9), `postfix`, `auditd` |
+| **Monitored Agent Server** | `vnc-server` | `11.11.2.143` | RHEL 9.8 (`x86_64`) | `wazuh-agent` (v4.14.9), `auditd`, `sshd` (`internal-sftp`) |
 
 ### Network & Firewall Port Matrix
 
@@ -51,7 +51,7 @@ This runbook documents the complete end-to-end deployment of **Wazuh v4.14.9** (
   * *Lesson Learned:* Attempting the All-in-One installation on a 29 GB root volume without swap or pre-installed libraries caused `wazuh-dashboard` (286 MB RPM / 960 MB unpacked) to fail during package installation and trigger an automatic rollback.
 
 ### Step 1: Update OS Packages and Reboot
-**Execute on:** `wazuh-server` (`<WAZUH_SERVER_IP>`) **and** `vnc-server` (`<AGENT_SERVER_IP>`)
+**Execute on:** `wazuh-server` (`11.11.2.7`) **and** `vnc-server` (`11.11.2.143`)
 
 ```bash
 sudo dnf clean all
@@ -67,7 +67,7 @@ uname -r
 ```
 
 ### Step 2: Set Hostname, 4 GB Swap File, and Kernel Parameters
-**Execute on:** `wazuh-server` (`<WAZUH_SERVER_IP>`)
+**Execute on:** `wazuh-server` (`11.11.2.7`)
 
 ```bash
 # 1. Set system hostname
@@ -95,7 +95,7 @@ sysctl vm.max_map_count
 ```
 
 ### Step 3: Verify / Expand Root Partition Space (`100 GB`)
-**Execute on:** `wazuh-server` (`<WAZUH_SERVER_IP>`)
+**Execute on:** `wazuh-server` (`11.11.2.7`)
 
 ```bash
 df -h /
@@ -106,7 +106,7 @@ sudo xfs_growfs /
 ```
 
 ### Step 4: Configure DNF Timeout Resiliency & Pre-Install OS Libraries
-**Execute on:** `wazuh-server` (`<WAZUH_SERVER_IP>`)
+**Execute on:** `wazuh-server` (`11.11.2.7`)
 
 Modify `/etc/dnf/dnf.conf` and install the shared libraries required by `wazuh-dashboard`, `wazuh-indexer`, and `wazuh-manager`:
 
@@ -117,7 +117,7 @@ sudo dnf install -y curl tar coreutils gnupg2 lsof libcap fontconfig nss openssl
 ```
 
 ### Step 5: Open Required Ports in `firewalld`
-**Execute on:** `wazuh-server` (`<WAZUH_SERVER_IP>`)
+**Execute on:** `wazuh-server` (`11.11.2.7`)
 
 ```bash
 if systemctl is-active --quiet firewalld; then
@@ -131,7 +131,7 @@ fi
 ## 3. Wazuh Installation and Initial Configuration (Completed)
 
 ### Step 1: Run the Official Wazuh 4.14 All-in-One Installation Assistant
-**Execute on:** `wazuh-server` (`<WAZUH_SERVER_IP>`)
+**Execute on:** `wazuh-server` (`11.11.2.7`)
 
 ```bash
 cd ~
@@ -142,14 +142,14 @@ sudo bash ./wazuh-install.sh -a -i -v
 When the script finishes, it outputs the access summary:
 ```text
 INFO: --- Summary ---
-INFO: You can access the web interface https://<WAZUH_SERVER_IP>:443
+INFO: You can access the web interface https://11.11.2.7:443
     User: admin
     Password: <WAZUH_ADMIN_PASSWORD>
 INFO: Installation finished.
 ```
 
 ### Step 2: Back Up Credentials and Disable Repository Auto-Updates
-**Execute on:** `wazuh-server` (`<WAZUH_SERVER_IP>`)
+**Execute on:** `wazuh-server` (`11.11.2.7`)
 
 Back up `wazuh-install-files.tar` to `/root/` and disable `/etc/yum.repos.d/wazuh.repo` so routine `dnf upgrade` commands do not unintentionally upgrade Wazuh out of sync:
 
@@ -170,18 +170,18 @@ sudo systemctl status wazuh-indexer wazuh-manager filebeat wazuh-dashboard --no-
 ## 4. Wazuh Agent Installation and Registration (Completed)
 
 ### Selecting and Preparing a Monitored Agent Server
-Any RHEL 9 server (such as `vnc-server` at `<AGENT_SERVER_IP>`) that hosts user sessions, SSH/SFTP access, or critical engineering data should have `wazuh-agent` installed. The agent requires outbound TCP connectivity to `<WAZUH_SERVER_IP>` on ports **1514** and **1515**.
+Any RHEL 9 server (such as `vnc-server` at `11.11.2.143`) that hosts user sessions, SSH/SFTP access, or critical engineering data should have `wazuh-agent` installed. The agent requires outbound TCP connectivity to `11.11.2.7` on ports **1514** and **1515**.
 
 ### Step 1: Verify Connectivity to the Wazuh Manager
-**Execute on:** `vnc-server` (`<AGENT_SERVER_IP>`)
+**Execute on:** `vnc-server` (`11.11.2.143`)
 
 ```bash
-timeout 3 bash -c "</dev/tcp/<WAZUH_SERVER_IP>/1514 && echo 'Port 1514 Open'"
-timeout 3 bash -c "</dev/tcp/<WAZUH_SERVER_IP>/1515 && echo 'Port 1515 Open'"
+timeout 3 bash -c "</dev/tcp/11.11.2.7/1514 && echo 'Port 1514 Open'"
+timeout 3 bash -c "</dev/tcp/11.11.2.7/1515 && echo 'Port 1515 Open'"
 ```
 
 ### Step 2: Install and Register the Wazuh Agent via Direct RPM
-**Execute on:** `vnc-server` (`<AGENT_SERVER_IP>`)
+**Execute on:** `vnc-server` (`11.11.2.143`)
 
 Download the standalone `wazuh-agent-4.14.9-1.x86_64.rpm` package and pass `WAZUH_MANAGER` and `WAZUH_AGENT_NAME` directly to `rpm -ihv`:
 
@@ -189,13 +189,13 @@ Download the standalone `wazuh-agent-4.14.9-1.x86_64.rpm` package and pass `WAZU
 sudo rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH
 
 curl -o wazuh-agent-4.14.9-1.x86_64.rpm https://packages.wazuh.com/4.x/yum/wazuh-agent-4.14.9-1.x86_64.rpm && \
-sudo WAZUH_MANAGER='<WAZUH_SERVER_IP>' WAZUH_AGENT_NAME='vnc-server' rpm -ihv wazuh-agent-4.14.9-1.x86_64.rpm
+sudo WAZUH_MANAGER='11.11.2.7' WAZUH_AGENT_NAME='vnc-server' rpm -ihv wazuh-agent-4.14.9-1.x86_64.rpm
 
 rm -f wazuh-agent-4.14.9-1.x86_64.rpm
 ```
 
 ### Step 3: Enable and Start `wazuh-agent`
-**Execute on:** `vnc-server` (`<AGENT_SERVER_IP>`)
+**Execute on:** `vnc-server` (`11.11.2.143`)
 
 ```bash
 sudo systemctl daemon-reload
@@ -214,7 +214,7 @@ sudo /var/ossec/bin/agent_control -l
 To capture every command executed by `ec2-user`, `root`, and VNC users (`eng-001`..`eng-004`), track user/group modifications, log all SFTP transfers/failures, and stream logs to `wazuh-server` within 1–5 seconds, configure both `auditd`, `sshd`, and the Wazuh Agent.
 
 ### Step 1: Configure Kernel `auditd` Rules on the Agent
-**Execute on:** `vnc-server` (`<AGENT_SERVER_IP>`)
+**Execute on:** `vnc-server` (`11.11.2.143`)
 
 Create `/etc/audit/rules.d/wazuh-full-monitoring.rules` (and ensure any older duplicate file such as `wazuh-command-audit.rules` is removed and `/etc/tigervnc` exists so `augenrules` loads cleanly):
 
@@ -255,7 +255,7 @@ sudo auditctl -l
 ```
 
 ### Step 2: Configure Kernel `auditd` Rules on the Wazuh Server
-**Execute on:** `wazuh-server` (`<WAZUH_SERVER_IP>`)
+**Execute on:** `wazuh-server` (`11.11.2.7`)
 
 ```bash
 sudo tee /etc/audit/rules.d/wazuh-command-audit.rules << 'EOF'
@@ -270,7 +270,7 @@ sudo auditctl -l
 ```
 
 ### Step 3: Configure OpenSSH (`sshd`) for SFTP Verbose Logging & Group Access Control
-**Execute on:** `vnc-server` (`<AGENT_SERVER_IP>`)
+**Execute on:** `vnc-server` (`11.11.2.143`)
 
 Create the `sftp-allowed` and `sftp-denied` Linux groups, comment out the default `Subsystem sftp` line in `/etc/ssh/sshd_config`, and create `/etc/ssh/sshd_config.d/50-sftp-monitoring.conf`:
 
@@ -303,7 +303,7 @@ sudo sshd -t && sudo systemctl reload sshd
 ```
 
 ### Step 4: Configure 1-Second Log Streaming, `/var/log/secure`, and Real-Time Whodata FIM
-**Execute on:** `vnc-server` (`<AGENT_SERVER_IP>`)
+**Execute on:** `vnc-server` (`11.11.2.143`)
 
 1. Set the logcollector polling interval to 1 second in `/var/ossec/etc/local_internal_options.conf`:
    ```bash
@@ -336,7 +336,7 @@ sudo sshd -t && sudo systemctl reload sshd
 ## 6. Custom Wazuh Rules and Decoders (Completed)
 
 ### Custom PCRE2 SFTP Decoders
-**Execute on:** `wazuh-server` (`<WAZUH_SERVER_IP>`)
+**Execute on:** `wazuh-server` (`11.11.2.7`)
 
 On RHEL 9, SFTP events logged by `internal-sftp` use either the `sftp-server` or `sshd` program name. Because Wazuh's legacy `OS_Regex` parser rejects escaped brackets (`\[` and `\]`) and treats `\.+` as literal dots, we use Wazuh's `pcre2` engine (`type="pcre2"`) in `/var/ossec/etc/decoders/sftp_decoders.xml`.
 
@@ -425,7 +425,7 @@ sudo chmod 660 /var/ossec/etc/decoders/sftp_decoders.xml
 * **Rules `5901`, `5902`, `5903`:** Linux user/group creation, modification, or deletion.
 
 ### Custom SFTP & VNC Rules (`/var/ossec/etc/rules/sftp_and_vnc_rules.xml`)
-**Execute on:** `wazuh-server` (`<WAZUH_SERVER_IP>`)
+**Execute on:** `wazuh-server` (`11.11.2.7`)
 
 Create `/var/ossec/etc/rules/sftp_and_vnc_rules.xml`:
 ```xml
@@ -544,7 +544,7 @@ sudo /var/ossec/bin/wazuh-analysisd -t
 ## 8. Email Notification Configuration (Completed)
 
 ### Step 1: Install Postfix & Cyrus SASL Packages
-**Execute on:** `wazuh-server` (`<WAZUH_SERVER_IP>`)
+**Execute on:** `wazuh-server` (`11.11.2.7`)
 
 ```bash
 sudo dnf install -y postfix cyrus-sasl cyrus-sasl-plain s-nail
@@ -552,7 +552,7 @@ sudo systemctl enable --now postfix
 ```
 
 ### Step 2: Configure Postfix Gmail SMTP Relay with App Password
-**Execute on:** `wazuh-server` (`<WAZUH_SERVER_IP>`)
+**Execute on:** `wazuh-server` (`11.11.2.7`)
 
 1. Create `/etc/postfix/sasl_passwd` with your Gmail address and 16-character Google App Password:
    ```bash
@@ -590,7 +590,7 @@ sudo tail -n 15 /var/log/maillog
 ```
 
 ### Step 3: Enable Email Notification in Wazuh (`/var/ossec/etc/ossec.conf`)
-**Execute on:** `wazuh-server` (`<WAZUH_SERVER_IP>`)
+**Execute on:** `wazuh-server` (`11.11.2.7`)
 
 Configure `<global>` and `<email_alerts>` in `/var/ossec/etc/ossec.conf`:
 
@@ -631,7 +631,7 @@ To alert and email **only when a user or source IP fails authentication 5 times 
 * **Matching Conditions:** We match on `<if_matched_group>authentication_failed</if_matched_group>` (which covers SSH/SFTP invalid users `5710`, failed passwords `5716`, and PAM authentication failures `5503`) correlated by either `<same_source_ip />` (Rule `100510`) or `<same_user />` (Rule `100511`).
 
 ### Step 1: Add the 5-in-10-Minute Brute-Force Rules (`100510` and `100511`)
-**Execute on:** `wazuh-server` (`<WAZUH_SERVER_IP>`)
+**Execute on:** `wazuh-server` (`11.11.2.7`)
 
 Update `/var/ossec/etc/rules/sftp_and_vnc_rules.xml` to include Rules `100510` and `100511`:
 
@@ -794,7 +794,7 @@ sudo chmod 660 /var/ossec/etc/rules/sftp_and_vnc_rules.xml
 ```
 
 ### Step 2: Update `<email_alerts>` in `/var/ossec/etc/ossec.conf` to Suppress Single-Failure Email Noise
-**Execute on:** `wazuh-server` (`<WAZUH_SERVER_IP>`)
+**Execute on:** `wazuh-server` (`11.11.2.7`)
 
 Replace the `<rule_id>5710, 5712, 5716, 5720, 5760...</rule_id>` line in `/var/ossec/etc/ossec.conf` so individual failed logins (`5710`, `5716`) are still logged to the Wazuh Dashboard (Level 5), **but emails are only sent when the 5-attempt threshold (`100510`, `100511`) or SFTP rules (`100501`–`100505`) fire**:
 
@@ -818,7 +818,7 @@ sudo /var/ossec/bin/wazuh-analysisd -t && sudo systemctl restart wazuh-manager
    ```
    *Expected Result:* Attempts 1–4 trigger Rule `5716` (`level: '5'`, no email), while the 5th attempt triggers **Rule `100510` (`level: '12'`, `mail: 'True'`)**.
 
-2. **Live End-to-End Email Test from `vnc-server` (`<AGENT_SERVER_IP>`):**
+2. **Live End-to-End Email Test from `vnc-server` (`11.11.2.143`):**
    Run this loop on `vnc-server` to inject 5 failed login events into `/var/log/secure`:
    ```bash
    for i in {1..5}; do
@@ -827,7 +827,7 @@ sudo /var/ossec/bin/wazuh-analysisd -t && sudo systemctl restart wazuh-manager
    done
    ```
 
-3. **Verify the Alert and Email Delivery on `wazuh-server` (`<WAZUH_SERVER_IP>`):**
+3. **Verify the Alert and Email Delivery on `wazuh-server` (`11.11.2.7`):**
    *(Note: Wazuh stores alert logs in `/var/ossec/logs/alerts/alerts.log`, not `/var/log/alerts/alerts.log`.)*
    ```bash
    sudo tail -n 30 /var/ossec/logs/alerts/alerts.log
@@ -847,13 +847,13 @@ sudo /var/ossec/bin/wazuh-analysisd -t && sudo systemctl restart wazuh-manager
 | `wazuh-manager.service failed` after running `sed` for `<alert_new_files>` | Running `grep -q` without `sudo` returned `Permission denied`, triggering `\|\| sudo sed` across all `<scan_on_start>` tags in `<syscollector>` and `<sca>`. | Restored `/var/ossec/etc/ossec.conf.bak` and scoped the `sed` command strictly to `/<syscheck>/,/<\/syscheck>/`. |
 | `Error sending add rule data request (Rule exists)` in `auditd` | Both `wazuh-command-audit.rules` and `wazuh-full-monitoring.rules` existed in `/etc/audit/rules.d/`, and `/etc/tigervnc/` did not exist yet. | Removed the duplicate `wazuh-command-audit.rules` file, ran `sudo mkdir -p /etc/tigervnc`, and ran `sudo augenrules --load`. |
 | `XMLERR: Element 'email_maxperhour' not closed. (line 17)` | Copy-paste typo in `sed` command created `<email_maxperhour>1000</email_maxgmail.comperhour>`. | Fixed closing tag to `<email_maxperhour>1000</email_maxperhour>` and verified with `sudo /var/ossec/bin/wazuh-analysisd -t`. |
-| `Unit wazuh-agent.service not found` | Agent setup commands were accidentally pasted into the `wazuh-server` terminal (`[root@wazuh-server]#`). | Removed `/etc/ssh/sshd_config.d/50-sftp-monitoring.conf` from `wazuh-server`, restored `wazuh-server` config, and ran agent commands on `vnc-server` (`<AGENT_SERVER_IP>`). |
+| `Unit wazuh-agent.service not found` | Agent setup commands were accidentally pasted into the `wazuh-server` terminal (`[root@wazuh-server]#`). | Removed `/etc/ssh/sshd_config.d/50-sftp-monitoring.conf` from `wazuh-server`, restored `wazuh-server` config, and ran agent commands on `vnc-server` (`11.11.2.143`). |
 | `ERROR: (1452): Syntax error on regex: '^session opened for local user (\S+) from \[(\S+)\]'` | Wazuh's default `OS_Regex` parser does not support `\[` and `\]` or `[^"]+` character classes. | Added `type="pcre2"` to `<prematch type="pcre2">` and `<regex type="pcre2">` in `/var/ossec/etc/decoders/sftp_decoders.xml`. |
 | `tail: cannot open '/var/log/alerts/alerts.log': No such file or directory` | Wazuh stores alerts inside `/var/ossec/logs/alerts/alerts.log` (not `/var/log/`). | Use `sudo tail -f /var/ossec/logs/alerts/alerts.log`. |
 
 ### Essential Validation & Troubleshooting Commands
 
-**Execute on `wazuh-server` (`<WAZUH_SERVER_IP>`):**
+**Execute on `wazuh-server` (`11.11.2.7`):**
 ```bash
 # 1. Validate XML syntax of ossec.conf, custom decoders, and custom rules
 sudo /var/ossec/bin/wazuh-analysisd -t
@@ -871,7 +871,7 @@ sudo tail -f /var/ossec/logs/alerts/alerts.log
 sudo tail -f /var/log/maillog
 ```
 
-**Execute on `vnc-server` (`<AGENT_SERVER_IP>`):**
+**Execute on `vnc-server` (`11.11.2.143`):**
 ```bash
 # 1. Verify Wazuh Agent service and manager connection
 sudo systemctl status wazuh-agent --no-pager
