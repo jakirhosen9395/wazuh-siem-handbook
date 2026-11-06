@@ -12,8 +12,8 @@ Replace the following placeholders with your actual environment values when exec
 
 | Placeholder | Description | Reference Value from Deployment |
 | :--- | :--- | :--- |
-| `<WAZUH_SERVER_IP>` | Private IPv4 of the Wazuh All-in-One Server (`wazuh-server`) | `11.11.2.218` |
-| `<AGENT_SERVER_IP>` | Private IPv4 of the Monitored Linux Agent (`vnc-server`) | `11.11.2.213` |
+| `<WAZUH_SERVER_IP>` | Private IPv4 of the Wazuh All-in-One Server (`wazuh-server`) | `11.11.2.99` |
+| `<AGENT_SERVER_IP>` | Private IPv4 of the Monitored Linux Agent (`vnc-server`) | `11.11.2.242` |
 | `<TEST_CLIENT_IP_1>` | First IPv4 used for SSH/SFTP testing | `11.11.2.50` |
 | `<TEST_CLIENT_IP_2>` | Second IPv4 used for multi-IP & brute-force testing | `11.11.2.99` |
 | `<SENDER_EMAIL_ADDRESS>` | Gmail / SMTP account used by Postfix to send alerts | `your-sender@gmail.com` |
@@ -23,7 +23,7 @@ Replace the following placeholders with your actual environment values when exec
 
 ```text
 +-----------------------------------------------------------------------------------+
-| MONITORED LINUX AGENT: vnc-server (<AGENT_SERVER_IP>) - RHEL 9.8 (x86_64)         |
+| MONITORED LINUX AGENT: vnc-server (11.11.2.242) - RHEL 9.8 (x86_64)         |
 |                                                                                   |
 |  +-----------------------+   +-----------------------+   +---------------------+  |
 |  | /var/log/secure       |   | /var/log/audit/       |   | Command & FIM       |  |
@@ -41,7 +41,7 @@ Replace the following placeholders with your actual environment values when exec
                                            |
                                            v
 +-----------------------------------------------------------------------------------+
-| WAZUH ALL-IN-ONE SERVER: wazuh-server (<WAZUH_SERVER_IP>) - RHEL 9.8 (x86_64)     |
+| WAZUH ALL-IN-ONE SERVER: wazuh-server (11.11.2.99) - RHEL 9.8 (x86_64)     |
 |                                                                                   |
 |  wazuh-remoted (1514/TCP) ---> wazuh-analysisd                                    |
 |                                  |-- Built-in Decoders (sshd, pam, auditd)        |
@@ -73,12 +73,12 @@ Replace the following placeholders with your actual environment values when exec
 
 | Port | Protocol | Source | Destination | Component / Service | Purpose |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **443** | TCP | Admin Workstations | `<WAZUH_SERVER_IP>` | `wazuh-dashboard` | Wazuh Web UI (HTTPS) |
-| **1514** | TCP | `<AGENT_SERVER_IP>` | `<WAZUH_SERVER_IP>` | `wazuh-remoted` | Encrypted agent event forwarding |
-| **1515** | TCP | `<AGENT_SERVER_IP>` | `<WAZUH_SERVER_IP>` | `wazuh-authd` | Agent enrollment and key exchange |
-| **55000** | TCP | `127.0.0.1` / Admins | `<WAZUH_SERVER_IP>` | `wazuh-apid` | Wazuh Manager RESTful API |
+| **443** | TCP | Admin Workstations | `11.11.2.99` | `wazuh-dashboard` | Wazuh Web UI (HTTPS) |
+| **1514** | TCP | `11.11.2.242` | `11.11.2.99` | `wazuh-remoted` | Encrypted agent event forwarding |
+| **1515** | TCP | `11.11.2.242` | `11.11.2.99` | `wazuh-authd` | Agent enrollment and key exchange |
+| **55000** | TCP | `127.0.0.1` / Admins | `11.11.2.99` | `wazuh-apid` | Wazuh Manager RESTful API |
 | **9200** | TCP | `127.0.0.1` | `127.0.0.1` | `wazuh-indexer` | OpenSearch REST API (Localhost only) |
-| **587** | TCP | `<WAZUH_SERVER_IP>` | `smtp.gmail.com` | `postfix` | Outbound STARTTLS email alert delivery |
+| **587** | TCP | `11.11.2.99` | `smtp.gmail.com` | `postfix` | Outbound STARTTLS email alert delivery |
 | **22** | TCP | Authorized Subnets | Both Servers | `sshd` | SSH and `internal-sftp` access |
 
 ### 1.4 Audit of Completed vs. Pending Configurations
@@ -99,7 +99,7 @@ Replace the following placeholders with your actual environment values when exec
 ## 2. Phase 1: Wazuh Server OS Preparation (From Empty Server)
 
 ### Step 1: Update All OS Packages, Kernel, and Reboot
-* **Server:** Wazuh Manager (`wazuh-server` — `<WAZUH_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Manager (`wazuh-server` — `11.11.2.99`, RHEL 9.8)
 * **Files Modified:** System packages and Linux kernel
 
 #### Commands:
@@ -122,7 +122,7 @@ The server boots into the latest RHEL 9.8 kernel (`5.14.0-687.66.1.el9_8.x86_64`
 ---
 
 ### Step 2: Configure System Hostname, 4 GB Swap File, and Kernel Virtual Memory Parameters
-* **Server:** Wazuh Manager (`wazuh-server` — `<WAZUH_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Manager (`wazuh-server` — `11.11.2.99`, RHEL 9.8)
 * **Files Modified:** `/etc/hostname`, `/swapfile`, `/etc/fstab`, `/etc/sysctl.d/99-wazuh.conf`
 
 #### Configuration (`/etc/sysctl.d/99-wazuh.conf`):
@@ -164,7 +164,7 @@ sysctl vm.max_map_count vm.swappiness
 ---
 
 ### Step 3: Verify and Expand Root Filesystem Capacity (`100 GB`)
-* **Server:** Wazuh Manager (`wazuh-server` — `<WAZUH_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Manager (`wazuh-server` — `11.11.2.99`, RHEL 9.8)
 * **Device Modified:** `/dev/nvme0n1p4` (`/`)
 
 #### Commands:
@@ -185,7 +185,7 @@ df -h /
 ---
 
 ### Step 4: Configure DNF Resiliency, Pre-Install OS Dependencies, and Open Firewall Ports
-* **Server:** Wazuh Manager (`wazuh-server` — `<WAZUH_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Manager (`wazuh-server` — `11.11.2.99`, RHEL 9.8)
 * **File Modified:** `/etc/dnf/dnf.conf`
 
 #### Commands:
@@ -219,7 +219,7 @@ All 10 RPM packages return their installed RHEL 9 versions without error, and `t
 Below are both the **Automated Installation Assistant (Method A)** used in our deployment and the **Step-by-Step Component Installation (Method B)** showing exact repository creation, certificate generation, Indexer, Manager, Filebeat, and Dashboard installation.
 
 ### Step 5A: Install Wazuh All-in-One Using the Official Installation Assistant (Method A — Primary)
-* **Server:** Wazuh Manager (`wazuh-server` — `<WAZUH_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Manager (`wazuh-server` — `11.11.2.99`, RHEL 9.8)
 * **Files Created:**
   * `/etc/yum.repos.d/wazuh.repo`
   * `~/wazuh-install-files.tar` (contains root-ca, node certificates, and `wazuh-passwords.txt`)
@@ -254,7 +254,7 @@ Terminal prints `INFO: Installation finished.` along with the `admin` user and `
 ---
 
 ### Step 5B: Step-by-Step Component Installation Reference (Method B — If Installing Each Component Individually)
-* **Server:** Wazuh Manager (`wazuh-server` — `<WAZUH_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Manager (`wazuh-server` — `11.11.2.99`, RHEL 9.8)
 * **Files Created:** `config.yml`, `/etc/yum.repos.d/wazuh.repo`, `/etc/wazuh-indexer/opensearch.yml`, `/etc/filebeat/filebeat.yml`, `/etc/wazuh-dashboard/opensearch_dashboards.yml`
 
 *(Execute Method B only if you choose not to run the single `-a` flag in Step 5A.)*
@@ -328,7 +328,7 @@ sudo bash ./wazuh-install.sh --wazuh-dashboard dashboard -i
 ---
 
 ### Step 6: Verify All Wazuh Services, Back Up Certificates/Passwords, and Lock the Repository
-* **Server:** Wazuh Manager (`wazuh-server` — `<WAZUH_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Manager (`wazuh-server` — `11.11.2.99`, RHEL 9.8)
 * **Files Modified:** `/root/wazuh-install-files-backup.tar`, `/etc/yum.repos.d/wazuh.repo`
 
 #### Commands:
@@ -358,7 +358,7 @@ sudo curl -k -u admin:<WAZUH_ADMIN_PASSWORD> https://127.0.0.1:9200/_cluster/hea
 ## 4. Phase 3: Complete Wazuh Agent Installation & Registration (`vnc-server`)
 
 ### Step 7: Prepare the Agent OS and Verify Network Connectivity to the Wazuh Manager
-* **Server:** Wazuh Agent (`vnc-server` — `<AGENT_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Agent (`vnc-server` — `11.11.2.242`, RHEL 9.8)
 * **Files Modified:** System packages
 
 #### Commands:
@@ -373,8 +373,8 @@ sudo dnf install -y audit curl coreutils
 sudo systemctl enable --now auditd
 
 # 3. Verify TCP connectivity to Wazuh Manager on ports 1514 and 1515
-timeout 3 bash -c "</dev/tcp/<WAZUH_SERVER_IP>/1514 && echo 'Port 1514 (Remoted) Open'"
-timeout 3 bash -c "</dev/tcp/<WAZUH_SERVER_IP>/1515 && echo 'Port 1515 (Authd) Open'"
+timeout 3 bash -c "</dev/tcp/11.11.2.99/1514 && echo 'Port 1514 (Remoted) Open'"
+timeout 3 bash -c "</dev/tcp/11.11.2.99/1515 && echo 'Port 1515 (Authd) Open'"
 ```
 
 #### Validation:
@@ -388,7 +388,7 @@ Both port checks print `Open`, and `auditd` returns `active`.
 ---
 
 ### Step 8: Install, Enroll, and Start the Wazuh v4.14.9 Agent
-* **Server:** Wazuh Agent (`vnc-server` — `<AGENT_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Agent (`vnc-server` — `11.11.2.242`, RHEL 9.8)
 * **Files Created/Modified:** `/var/ossec/etc/ossec.conf`, `/var/ossec/etc/client.keys`, `/var/ossec/etc/local_internal_options.conf`
 
 #### Commands:
@@ -398,7 +398,7 @@ sudo rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH
 
 # 2. Download and install the Wazuh Agent 4.14.9 RPM with auto-enrollment variables
 curl -o wazuh-agent-4.14.9-1.x86_64.rpm https://packages.wazuh.com/4.x/yum/wazuh-agent-4.14.9-1.x86_64.rpm && \
-sudo WAZUH_MANAGER='<WAZUH_SERVER_IP>' WAZUH_AGENT_NAME='vnc-server' rpm -ihv wazuh-agent-4.14.9-1.x86_64.rpm
+sudo WAZUH_MANAGER='11.11.2.99' WAZUH_AGENT_NAME='vnc-server' rpm -ihv wazuh-agent-4.14.9-1.x86_64.rpm
 
 # 3. Clean up the downloaded RPM file
 rm -f wazuh-agent-4.14.9-1.x86_64.rpm
@@ -424,14 +424,14 @@ sudo /var/ossec/bin/agent_control -l
 ```
 
 #### Expected Result:
-Agent `ossec.log` shows `Valid key received` and `Connected to the server ([<WAZUH_SERVER_IP>]:1514/tcp)`, and `agent_control -l` on the Manager lists `ID: 001, Name: vnc-server, IP: any, Active`.
+Agent `ossec.log` shows `Valid key received` and `Connected to the server ([11.11.2.99]:1514/tcp)`, and `agent_control -l` on the Manager lists `ID: 001, Name: vnc-server, IP: any, Active`.
 
 ---
 
 ## 5. Phase 4: Complete SSH, SFTP, Command, FIM, and Network Monitoring Setup
 
 ### Step 9: Configure OpenSSH (`sshd`) for Verbose Authentication Logging & SFTP Access Control
-* **Server:** Wazuh Agent (`vnc-server` — `<AGENT_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Agent (`vnc-server` — `11.11.2.242`, RHEL 9.8)
 * **Files Modified:** `/etc/ssh/sshd_config`, `/etc/ssh/sshd_config.d/50-sftp-monitoring.conf`
 
 #### Configuration (`/etc/ssh/sshd_config.d/50-sftp-monitoring.conf`):
@@ -581,7 +581,7 @@ sudo auditctl -l
 ---
 
 ### Step 11: Configure Complete Wazuh Agent `ossec.conf` (SSH, SFTP, Auditd, Whodata FIM & Port Monitoring)
-* **Server:** Wazuh Agent (`vnc-server` — `<AGENT_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Agent (`vnc-server` — `11.11.2.242`, RHEL 9.8)
 * **File Modified:** `/var/ossec/etc/ossec.conf`
 
 #### Complete Configuration (`/var/ossec/etc/ossec.conf` on Agent):
@@ -589,7 +589,7 @@ sudo auditctl -l
 <ossec_config>
   <client>
     <server>
-      <address><WAZUH_SERVER_IP></address>
+      <address>11.11.2.99</address>
       <port>1514</port>
       <protocol>tcp</protocol>
     </server>
@@ -759,7 +759,7 @@ sudo tee /var/ossec/etc/ossec.conf << 'EOF'
 <ossec_config>
   <client>
     <server>
-      <address><WAZUH_SERVER_IP></address>
+      <address>11.11.2.99</address>
       <port>1514</port>
       <protocol>tcp</protocol>
     </server>
@@ -937,7 +937,7 @@ sudo grep -E "Analyzing file|Whodata|active listening sockets" /var/ossec/logs/o
 ---
 
 ### Step 12: Configure Complete Wazuh Manager `ossec.conf` (With HTML Email Integration Enabled)
-* **Server:** Wazuh Manager (`wazuh-server` — `<WAZUH_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Manager (`wazuh-server` — `11.11.2.99`, RHEL 9.8)
 * **File Modified:** `/var/ossec/etc/ossec.conf`
 
 *(Note: In this complete Manager configuration, `<email_notification>no</email_notification>` is set so legacy plain-text emails from `wazuh-maild` do not duplicate the rich HTML incident emails sent by `<integration><name>custom-html-email.py</name></integration>`.)*
@@ -952,8 +952,8 @@ sudo grep -E "Analyzing file|Whodata|active listening sockets" /var/ossec/logs/o
     <logall_json>no</logall_json>
     <email_notification>no</email_notification>
     <smtp_server>localhost</smtp_server>
-    <email_from><SENDER_EMAIL_ADDRESS></email_from>
-    <email_to><RECIPIENT_EMAIL_ADDRESS></email_to>
+    <email_from>devops.jakir@gmail.com</email_from>
+    <email_to>hiddenclue0@gmail.com</email_to>
     <email_maxperhour>1000</email_maxperhour>
     <email_log_source>alerts.log</email_log_source>
     <agents_disconnection_time>15m</agents_disconnection_time>
@@ -1253,8 +1253,8 @@ sudo tee /var/ossec/etc/ossec.conf << 'EOF'
     <logall_json>no</logall_json>
     <email_notification>no</email_notification>
     <smtp_server>localhost</smtp_server>
-    <email_from><SENDER_EMAIL_ADDRESS></email_from>
-    <email_to><RECIPIENT_EMAIL_ADDRESS></email_to>
+    <email_from>devops.jakir@gmail.com</email_from>
+    <email_to>hiddenclue0@gmail.com</email_to>
     <email_maxperhour>1000</email_maxperhour>
     <email_log_source>alerts.log</email_log_source>
     <agents_disconnection_time>15m</agents_disconnection_time>
@@ -1557,7 +1557,7 @@ sudo /var/ossec/bin/wazuh-analysisd -t
 ## 6. Phase 5: Custom Decoders & Security Detection Rules
 
 ### Step 13: Create Custom PCRE2 SFTP Decoders (`sftp_decoders.xml`)
-* **Server:** Wazuh Manager (`wazuh-server` — `<WAZUH_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Manager (`wazuh-server` — `11.11.2.99`, RHEL 9.8)
 * **File Created:** `/var/ossec/etc/decoders/sftp_decoders.xml`
 
 #### Configuration (`/var/ossec/etc/decoders/sftp_decoders.xml`):
@@ -1646,7 +1646,7 @@ sudo /var/ossec/bin/wazuh-analysisd -t
 ---
 
 ### Step 14: Create Custom SFTP & TigerVNC Monitoring Rules (`sftp_and_vnc_rules.xml`)
-* **Server:** Wazuh Manager (`wazuh-server` — `<WAZUH_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Manager (`wazuh-server` — `11.11.2.99`, RHEL 9.8)
 * **File Created:** `/var/ossec/etc/rules/sftp_and_vnc_rules.xml`
 
 #### Configuration (`/var/ossec/etc/rules/sftp_and_vnc_rules.xml`):
@@ -1761,7 +1761,7 @@ sudo /var/ossec/bin/wazuh-analysisd -t
 ---
 
 ### Step 15: Create Custom SSH Threat Detection & Network Rules (`ssh_and_network_rules.xml`)
-* **Server:** Wazuh Manager (`wazuh-server` — `<WAZUH_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Manager (`wazuh-server` — `11.11.2.99`, RHEL 9.8)
 * **File Created:** `/var/ossec/etc/rules/ssh_and_network_rules.xml`
 
 #### Complete Rule Specification Matrix
@@ -2113,12 +2113,12 @@ sudo /var/ossec/bin/wazuh-analysisd -t
 ## 7. Phase 6: Postfix SMTP Relay & Executive HTML Email Notification System
 
 ### Step 16: Install and Configure Postfix Gmail STARTTLS Relay
-* **Server:** Wazuh Manager (`wazuh-server` — `<WAZUH_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Manager (`wazuh-server` — `11.11.2.99`, RHEL 9.8)
 * **Files Modified:** `/etc/postfix/sasl_passwd`, `/etc/postfix/main.cf`
 
 #### Configuration (`/etc/postfix/sasl_passwd`):
 ```text
-[smtp.gmail.com]:587 <SENDER_EMAIL_ADDRESS>:<GMAIL_16_CHAR_APP_PASSWORD>
+[smtp.gmail.com]:587 devops.jakir@gmail.com:<GMAIL_16_CHAR_APP_PASSWORD>
 ```
 
 #### Configuration (Appended to `/etc/postfix/main.cf`):
@@ -2141,7 +2141,7 @@ sudo systemctl enable --now postfix
 
 # 2. Create and hash the SASL password map
 sudo tee /etc/postfix/sasl_passwd << 'EOF'
-[smtp.gmail.com]:587 <SENDER_EMAIL_ADDRESS>:<GMAIL_16_CHAR_APP_PASSWORD>
+[smtp.gmail.com]:587 devops.jakir@gmail.com:<GMAIL_16_CHAR_APP_PASSWORD>
 EOF
 sudo chmod 600 /etc/postfix/sasl_passwd
 sudo postmap /etc/postfix/sasl_passwd
@@ -2168,7 +2168,7 @@ sudo systemctl restart postfix
 
 #### Validation:
 ```bash
-echo "Postfix SMTP Relay Verification from Wazuh Server" | mail -s "Wazuh Postfix Relay Test" <RECIPIENT_EMAIL_ADDRESS>
+echo "Postfix SMTP Relay Verification from Wazuh Server" | mail -s "Wazuh Postfix Relay Test" hiddenclue0@gmail.com
 sleep 3
 sudo tail -n 15 /var/log/maillog
 ```
@@ -2179,7 +2179,7 @@ sudo tail -n 15 /var/log/maillog
 ---
 
 ### Step 17: Create the Custom Python HTML Email Integration Script (`custom-html-email.py`)
-* **Server:** Wazuh Manager (`wazuh-server` — `<WAZUH_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Manager (`wazuh-server` — `11.11.2.99`, RHEL 9.8)
 * **File Created:** `/var/ossec/integrations/custom-html-email.py`
 
 #### Complete Script (`/var/ossec/integrations/custom-html-email.py`):
@@ -2202,8 +2202,8 @@ from email.mime.text import MIMEText
 
 SMTP_SERVER = "127.0.0.1"
 SMTP_PORT = 25
-SENDER_EMAIL = "<SENDER_EMAIL_ADDRESS>"
-RECIPIENT_EMAILS = ["<RECIPIENT_EMAIL_ADDRESS>"]
+SENDER_EMAIL = "devops.jakir@gmail.com"
+RECIPIENT_EMAILS = ["hiddenclue0@gmail.com"]
 
 
 def get_severity_info(level):
@@ -2590,8 +2590,8 @@ from email.mime.text import MIMEText
 
 SMTP_SERVER = "127.0.0.1"
 SMTP_PORT = 25
-SENDER_EMAIL = "<SENDER_EMAIL_ADDRESS>"
-RECIPIENT_EMAILS = ["<RECIPIENT_EMAIL_ADDRESS>"]
+SENDER_EMAIL = "devops.jakir@gmail.com"
+RECIPIENT_EMAILS = ["hiddenclue0@gmail.com"]
 
 
 def get_severity_info(level):
@@ -2970,7 +2970,7 @@ sudo chmod 750 /var/ossec/integrations/custom-html-email.py
 ---
 
 ### Step 18: Validate and Restart `wazuh-manager` to Activate All Rules & HTML Email Integration
-* **Server:** Wazuh Manager (`wazuh-server` — `<WAZUH_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Manager (`wazuh-server` — `11.11.2.99`, RHEL 9.8)
 
 #### Commands:
 ```bash
@@ -3117,7 +3117,7 @@ sudo tail -n 25 /var/log/maillog
 ## 10. Production Readiness, Hardening & Backup Checklist
 
 ### Step 19: Create Automated Configuration Backup Archive
-* **Server:** Wazuh Manager (`wazuh-server` — `<WAZUH_SERVER_IP>`, RHEL 9.8)
+* **Server:** Wazuh Manager (`wazuh-server` — `11.11.2.99`, RHEL 9.8)
 
 #### Commands:
 ```bash
