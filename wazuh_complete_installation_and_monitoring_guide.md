@@ -1787,9 +1787,6 @@ sudo /var/ossec/bin/wazuh-analysisd -t
 ```xml
 <group name="ssh_security_monitoring,network_security_monitoring,">
 
-  <!-- ========================================================================= -->
-  <!-- RULE 1: SSH Brute-Force Detection (5 Failed Attempts Within 5 Minutes)    -->
-  <!-- ========================================================================= -->
   <rule id="100601" level="12" frequency="5" timeframe="300">
     <if_matched_group>authentication_failed</if_matched_group>
     <same_source_ip />
@@ -1810,10 +1807,6 @@ sudo /var/ossec/bin/wazuh-analysisd -t
     <group>authentication_failures,ssh_brute_force,email_notify_alert,</group>
   </rule>
 
-  <!-- ========================================================================= -->
-  <!-- RULE 2: Multiple IP Addresses Accessing the Same User Within 5 Minutes    -->
-  <!-- Uses Wazuh native <same_user /> + <different_srcip /> correlation         -->
-  <!-- ========================================================================= -->
   <rule id="100603" level="11" frequency="2" timeframe="300">
     <if_matched_sid>5715</if_matched_sid>
     <same_user />
@@ -1825,9 +1818,6 @@ sudo /var/ossec/bin/wazuh-analysisd -t
     <group>authentication_success,ssh_multi_ip,email_notify_alert,</group>
   </rule>
 
-  <!-- ========================================================================= -->
-  <!-- RULE 3: Multiple Usernames Targeted From One IP (Username Enumeration)    -->
-  <!-- ========================================================================= -->
   <rule id="100604" level="12" frequency="4" timeframe="300">
     <if_matched_group>authentication_failed</if_matched_group>
     <same_source_ip />
@@ -1839,9 +1829,6 @@ sudo /var/ossec/bin/wazuh-analysisd -t
     <group>authentication_failures,ssh_enumeration,email_notify_alert,</group>
   </rule>
 
-  <!-- ========================================================================= -->
-  <!-- RULE 4: Successful SSH Login After Repeated Failures                      -->
-  <!-- ========================================================================= -->
   <rule id="100605" level="14" timeframe="300">
     <if_sid>5715</if_sid>
     <if_matched_sid>100601</if_matched_sid>
@@ -1854,9 +1841,6 @@ sudo /var/ossec/bin/wazuh-analysisd -t
     <group>authentication_success,ssh_compromise_indicator,email_notify_alert,</group>
   </rule>
 
-  <!-- ========================================================================= -->
-  <!-- RULE 5: Root SSH Login Detection                                          -->
-  <!-- ========================================================================= -->
   <rule id="100606" level="12">
     <if_sid>5715</if_sid>
     <user>^root$</user>
@@ -1877,12 +1861,14 @@ sudo /var/ossec/bin/wazuh-analysisd -t
     <group>authentication_failed,root_ssh_login,</group>
   </rule>
 
-  <!-- ========================================================================= -->
-  <!-- RULE 6: Suspicious SSH Access (External IP, Off-Hours, SSHD Config Edit)  -->
-  <!-- ========================================================================= -->
   <rule id="100608" level="11">
     <if_sid>5715</if_sid>
-    <srcip negate="yes">^11\.|^10\.|^192\.168\.|^172\.16\.|^172\.17\.|^172\.18\.|^172\.19\.|^172\.2[0-9]\.|^172\.3[0-1]\.|^127\.</srcip>
+    <!-- Use standard Wazuh syntax for negating IP networks (! means NOT) -->
+    <srcip>!10.0.0.0/8</srcip>
+    <srcip>!11.0.0.0/8</srcip>
+    <srcip>!172.16.0.0/12</srcip>
+    <srcip>!192.168.0.0/16</srcip>
+    <srcip>!127.0.0.0/8</srcip>
     <description>Suspicious External SSH Login: User $(dstuser) authenticated from non-private external IP $(srcip)</description>
     <mitre>
       <id>T1078</id>
@@ -1907,9 +1893,6 @@ sudo /var/ossec/bin/wazuh-analysisd -t
     <group>sshd_config_change,email_notify_alert,</group>
   </rule>
 
-  <!-- ========================================================================= -->
-  <!-- RULE 7: Suspicious Port, Listening Service, and Firewall Activity         -->
-  <!-- ========================================================================= -->
   <rule id="100620" level="10">
     <if_sid>530</if_sid>
     <match>^ossec: output: 'active listening sockets'</match>
@@ -2031,7 +2014,12 @@ sudo tee /var/ossec/etc/rules/ssh_and_network_rules.xml << 'EOF'
 
   <rule id="100608" level="11">
     <if_sid>5715</if_sid>
-    <srcip negate="yes">^11\.|^10\.|^192\.168\.|^172\.16\.|^172\.17\.|^172\.18\.|^172\.19\.|^172\.2[0-9]\.|^172\.3[0-1]\.|^127\.</srcip>
+    <!-- Use standard Wazuh syntax for negating IP networks (! means NOT) -->
+    <srcip>!10.0.0.0/8</srcip>
+    <srcip>!11.0.0.0/8</srcip>
+    <srcip>!172.16.0.0/12</srcip>
+    <srcip>!192.168.0.0/16</srcip>
+    <srcip>!127.0.0.0/8</srcip>
     <description>Suspicious External SSH Login: User $(dstuser) authenticated from non-private external IP $(srcip)</description>
     <mitre>
       <id>T1078</id>
