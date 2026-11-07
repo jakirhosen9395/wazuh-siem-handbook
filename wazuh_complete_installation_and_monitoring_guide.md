@@ -1,58 +1,106 @@
-# Wazuh Complete Monitoring, SSH/SFTP/VNC Auditing, and Team Management Guide (v1.0)
+# Wazuh v4.14.9 Complete Installation, RHEL 9.8 TigerVNC/SFTP Integration, and Team Management Guide
 
-## 1. Architecture and Prerequisites
+## 1. Introduction and Architecture
 
-### 1.1 Environment Topology
+This guide provides the complete, sequential procedure to install a fresh **Wazuh v4.14.9** central server from scratch on **Red Hat Enterprise Linux (RHEL) 9.8**, install and register the **Wazuh Agent**, integrate an existing **RHEL 9.8 TigerVNC and Chrooted SFTP server** without disrupting active services, and configure deduplicated HTML email alerts via **Postfix and Gmail SMTP**.
 
-This guide documents a two-server monitoring architecture running on **Red Hat Enterprise Linux (RHEL) 9.8 (`x86_64`)** on AWS EC2:
+### 1.1 Wazuh Core Components and Deployment Placement
 
-| Component Role | Hostname Placeholder | Private IP Placeholder | Operating System | Key Services |
-| :--- | :--- | :--- | :--- | :--- |
-| **Wazuh All-in-One Server** | `ec2-user` | `<WAZUH_MANAGER_IP>` | RHEL 9.8 (`x86_64`) | `wazuh-manager`, `wazuh-indexer`, `wazuh-dashboard`, `filebeat`, `postfix` |
-| **Monitored VNC/SFTP Server** | `vnc-server` | `<SERVER_PRIVATE_IP>` | RHEL 9.8 (`x86_64`) | `wazuh-agent`, `sshd`, `vncserver@:1..:N`, `auditd`, `rsyslog`, `firewalld` |
+| Component | Technical Role | Recommended Placement |
+| :--- | :--- | :--- |
+| **1. Wazuh Indexer** | OpenSearch-based (v2.19.6) distributed search and analytics engine that stores and indexes alerts in JSON format. | Installed **together** on the dedicated **Wazuh Central Server** (`172.31.7.137`) for single-node deployments (up to 50–100 agents). |
+| **2. Wazuh Manager** | Analyzes agent telemetry against decoders and rules (`wazuh-analysisd`), manages agent enrollment (`wazuh-authd`), receives encrypted agent streams (`wazuh-remoted`), and triggers integrations (`wazuh-integratord`). | Installed **together** on the **Wazuh Central Server** (`172.31.7.137`) alongside Filebeat (which ships alerts to the Indexer). |
+| **3. Wazuh Dashboard** | Web user interface (port `443/TCP`) for threat hunting, File Integrity Monitoring (FIM), vulnerability review, and Role-Based Access Control (RBAC). | Installed **together** on the **Wazuh Central Server** (`172.31.7.137`). |
+| **4. Wazuh Agent** | Lightweight host daemon installed on monitored Linux servers (`wazuh-agentd`, `wazuh-logcollector`, `wazuh-syscheckd`, `wazuh-modulesd`). | Installed **separately** on every monitored endpoint (such as `vnc-server` at `172.31.9.50`). Never install the Agent on the Wazuh Manager host. |
+| **5. Integrations & Notification Engine** | `wazuh-integratord` + `/var/ossec/integrations/custom-html-email.py` + local **Postfix** STARTTLS relay (`smtp.gmail.com:587`). | Installed on the **Wazuh Central Server** (`172.31.7.137`). |
 
-### 1.2 Event Pipeline Architecture
+### 1.2 End-to-End Architecture Diagram
 
 ```text
-[Monitored Server: vnc-server (<SERVER_PRIVATE_IP>)]
-  |-- /var/log/secure (SSH, PAM, SFTP session open/close)
-  |-- /srv/sftp/<user>/dev/log -> rsyslog -> /var/log/secure (Chrooted SFTP file actions)
-  |-- /var/log/audit/audit.log (Kernel execve commands, user/group modifications)
-  |-- /home/*/.local/share/tigervnc/*.log & /home/*/.vnc/*.log (TigerVNC display logs)
-        |
-        v
-  [wazuh-agent (TCP 1514 TLS)]
-        |
-        v
-[Wazuh Server: ec2-user (<WAZUH_MANAGER_IP>)]
-  |-- wazuh-remoted -> wazuh-analysisd
-  |-- Decoders: /var/ossec/etc/decoders/sftp_and_vnc_decoders.xml
-  |-- Rules:    /var/ossec/etc/rules/sftp_and_vnc_rules.xml
-  |             /var/ossec/etc/rules/ssh_and_network_rules.xml
-        |
-        +---> /var/ossec/logs/alerts/alerts.json ---> Filebeat ---> Wazuh Dashboard (443/TCP)
-        |
-        +---> wazuh-integratord ---> /var/ossec/integrations/custom-html-email.py
-                                       |-- Reads /var/ossec/etc/email_notification_policy.json
-                                       |-- Enforces Incident Deduplication & PID Session Cache
-                                       |-- Sends via Local Postfix (127.0.0.1:25) -> Gmail STARTTLS (587)
++---------------------------------------------------------------------------------------+
+| MONITORED ENDPOINT: vnc-server (172.31.9.50) - RHEL 9.8 (Existing TigerVNC/SFTP Host) |
+|                                                                                       |
+|  +-------------------------+  +-------------------------+  +-----------------------+  |
+|  | /var/log/secure         |  | /srv/sftp/<user>/dev/log|  | /home/*/.local/share/ |  |
+|  | (SSHD, PAM, SFTP Auth)  |  | (Bind-mounted journald  |  | tigervnc/*.log        |  |
+|  | LogLevel VERBOSE        |  |  socket for Chroot SFTP)|  | (Xvnc Display :1..:N) |  |
+|  +------------+------------+  +------------+------------+  +-----------+-----------+  |
+|               |                            |                           |              |
+|               +----------------------------+---------------------------+              |
+|                                            |                                          |
+|  +-------------------------+               v                                          |
+|  | /var/log/audit/audit.log| ---> wazuh-logcollector & wazuh-syscheckd (Whodata FIM)  |
+|  | (execve, passwd, group) |               |                                          |
+|  +-------------------------+               v                                          |
+|                                      wazuh-agentd                                     |
++--------------------------------------------|------------------------------------------+
+                                             |
+                        1514/TCP (TLS Events) & 1515/TCP (Enrollment)
+                                             |
+                                             v
++---------------------------------------------------------------------------------------+
+| WAZUH CENTRAL SERVER: ec2-user / wazuh-server (172.31.7.137) - RHEL 9.8               |
+|                                                                                       |
+|  wazuh-remoted (1514/TCP) & wazuh-authd (1515/TCP)                                    |
+|        |                                                                              |
+|        v                                                                              |
+|  wazuh-analysisd                                                                      |
+|   |-- Custom Decoders: /var/ossec/etc/decoders/sftp_decoders.xml                      |
+|   |-- Custom Rules:    /var/ossec/etc/rules/sftp_and_vnc_rules.xml                    |
+|   |                    /var/ossec/etc/rules/ssh_and_network_rules.xml                 |
+|        |                                                                              |
+|        +----------------------------+-------------------------------+                 |
+|        |                            |                               |                 |
+|        v                            v                               v                 |
+|  /var/ossec/logs/alerts/     wazuh-apid (55000/TCP)        wazuh-integratord          |
+|  alerts.json                        |                               |                 |
+|        |                            |                               v                 |
+|        v                            |                     custom-html-email.py        |
+|  Filebeat (9200/TCP mTLS)           |                      |-- Policy JSON Filter     |
+|        |                            |                      |-- fcntl Lock & Dedup     |
+|        v                            v                      |-- PID -> User Cache      |
+|  wazuh-indexer (9200/TCP) <---> wazuh-dashboard (443/TCP)           |                 |
+|  (OpenSearch + Internal Users)  (Admin: admin, Analyst: jakir,      v                 |
+|                                  Viewer: viewuser)         Postfix (127.0.0.1:25)     |
++---------------------------------------------------------------------|-----------------+
+                                                                      |
+                                                       587/TCP (STARTTLS + SASL Auth)
+                                                                      |
+                                                                      v
+                                                        smtp.gmail.com (devops.jakir@gmail.com)
+                                                                      |
+                                                                      v
+                                                        Alert Inbox (hiddenclue0@gmail.com)
 ```
-
-### 1.3 Network Port Requirements
-
-| Source | Destination | Port / Protocol | Purpose |
-| :--- | :--- | :--- | :--- |
-| `<SERVER_PRIVATE_IP>` | `<WAZUH_MANAGER_IP>` | `1514/TCP` | Wazuh Agent event stream |
-| `<SERVER_PRIVATE_IP>` | `<WAZUH_MANAGER_IP>` | `1515/TCP` | Wazuh Agent enrollment |
-| Admin Workstation | `<WAZUH_MANAGER_IP>` | `443/TCP` | Wazuh Dashboard HTTPS access |
-| `<WAZUH_MANAGER_IP>` | `smtp.gmail.com` | `587/TCP` | Outbound Postfix STARTTLS relay |
-| Engineering Clients | `<SERVER_PRIVATE_IP>` | `22/TCP`, `5901-5904/TCP` | SSH/SFTP and TigerVNC access |
 
 ---
 
-## 2. Environment Variables and Placeholders
+## 2. Prerequisites and Server Planning
 
-Replace the placeholder values below with your actual environment values before executing commands. Never commit real passwords or SMTP App Passwords into scripts or Git repositories.
+### 2.1 Hardware and Operating System Requirements
+
+| Server Role | IP Address | OS | Minimum CPU / RAM | Recommended Root Storage (`/`) | Swap Space |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Wazuh Central Server** | `172.31.7.137` | RHEL 9.8 (`x86_64`) | 4 vCPU / 8 GiB RAM | **100 GB GP3 EBS** (Minimum 50 GB free) | **4 GB `/swapfile`** |
+| **Wazuh Agent (`vnc-server`)** | `172.31.9.50` | RHEL 9.8 (`x86_64`) | 4 vCPU / 8 GiB RAM | 50 GB+ GP3 EBS | 2–4 GB Swap |
+
+### 2.2 Required Network & Firewall Ports
+
+| Server | Port | Protocol | Source | Service / Purpose |
+| :--- | :--- | :--- | :--- | :--- |
+| **Wazuh Central Server (`172.31.7.137`)** | `443` | TCP | Admin / Analyst IPs | Wazuh Dashboard Web UI (HTTPS) |
+| **Wazuh Central Server (`172.31.7.137`)** | `1514` | TCP | `172.31.9.50/32` (Agents) | Wazuh Agent encrypted event stream (`wazuh-remoted`) |
+| **Wazuh Central Server (`172.31.7.137`)** | `1515` | TCP | `172.31.9.50/32` (Agents) | Wazuh Agent registration (`wazuh-authd`) |
+| **Wazuh Central Server (`172.31.7.137`)** | `55000` | TCP | `127.0.0.1` / Admin IPs | Wazuh Server REST API (`wazuh-apid`) |
+| **Wazuh Central Server (`172.31.7.137`)** | `9200` | TCP | `127.0.0.1` | Wazuh Indexer REST API (OpenSearch) |
+| **Monitored Agent (`172.31.9.50`)** | `22` | TCP | Authorized Clients | OpenSSH & SFTP |
+| **Monitored Agent (`172.31.9.50`)** | `5901–5904` | TCP | Authorized Clients | TigerVNC Displays `:1` through `:4` |
+
+---
+
+## 3. Environment Variables and Placeholders
+
+Export this environment variable block in your root shell before running setup commands on either server. Replace `<GMAIL_APP_PASSWORD>`, `<LINUX_USERNAME>`, `<LINUX_GROUP>`, and `<VNC_DISPLAY_NUMBER>` when performing user-specific or SMTP credential steps.
 
 ```bash
 # ============================================================================
@@ -61,13 +109,13 @@ Replace the placeholder values below with your actual environment values before 
 
 # Wazuh Manager Server
 WAZUH_MANAGER_IP="172.31.7.137"                        # e.g., 172.31.15.207
-WAZUH_MANAGER_HOSTNAME="ec2-user"      # e.g., wazuh-server
+WAZUH_MANAGER_HOSTNAME="ec2-user"                      # e.g., wazuh-server
 
 # Monitored Linux / VNC / SFTP Agent Server
-WAZUH_AGENT_IP="172.31.9.50"             # e.g., 172.31.15.62
-WAZUH_AGENT_NAME="vnc-server"                   # e.g., vnc-server
-SERVER_HOSTNAME="vnc-server"                    # e.g., vnc-server
-SERVER_PRIVATE_IP="<SERVER_PRIVATE_IP>"                # e.g., 172.31.15.62
+WAZUH_AGENT_IP="172.31.9.50"                           # e.g., 172.31.15.62
+WAZUH_AGENT_NAME="vnc-server"                          # e.g., vnc-server
+SERVER_HOSTNAME="vnc-server"                           # e.g., vnc-server
+SERVER_PRIVATE_IP="172.31.9.50"                        # e.g., 172.31.15.62
 
 # Linux & VNC User Placeholders
 LINUX_USERNAME="<LINUX_USERNAME>"                      # e.g., user1, user2, user3, user4
@@ -77,86 +125,346 @@ VNC_DISPLAY="<VNC_DISPLAY_NUMBER>"                     # e.g., :1, :2, :3, :4
 # Postfix Gmail SMTP Relay Placeholders
 SMTP_HOST="smtp.gmail.com"
 SMTP_PORT="587"
-SMTP_USERNAME="devops.jakir@gmail.com"                        # Sender Gmail address
+SMTP_USERNAME="devops.jakir@gmail.com"                 # Sender Gmail address
 SMTP_APP_PASSWORD="<GMAIL_APP_PASSWORD>"               # 16-character Google App Password
-ALERT_RECIPIENT_EMAIL="hiddenclue0@gmail.com"        # Destination email address for alerts
+ALERT_RECIPIENT_EMAIL="hiddenclue0@gmail.com"          # Destination email address for alerts
 
 # Wazuh Dashboard Team Account Placeholders
-WAZUH_ADMIN_USERNAME="admin"          # Full administrative user
-WAZUH_ANALYST_USERNAME="jakir"      # Security analyst user
-WAZUH_VIEWER_USERNAME="viewuser"        # Read-only auditor/viewer user
+WAZUH_ADMIN_USERNAME="admin"                           # Full administrative user
+WAZUH_ANALYST_USERNAME="jakir"                         # Security analyst user
+WAZUH_VIEWER_USERNAME="viewuser"                       # Read-only auditor/viewer user
 ```
 
 ---
 
-## 3. Existing Wazuh Deployment Discovery
+## 4. Fresh Wazuh Server Installation (From Scratch on `172.31.7.137`)
 
-Before changing any files, inspect the current state on both servers.
+This section documents the complete installation of **Wazuh Indexer**, **Wazuh Manager**, **Filebeat**, and **Wazuh Dashboard** (`v4.14.9`) on a fresh RHEL 9.8 server (`172.31.7.137`).
 
-### 3.1 Inspect Wazuh Manager Version, Services, and Connected Agents
+### 4.1 Operating System Preparation, Swap, Kernel Tuning, and Disk Expansion
 
-* **Location:** Wazuh Manager (`ec2-user`)
+* **Location:** Wazuh Manager (`172.31.7.137`)
 * **Execution user:** `root`
-* **Purpose:** Verify the installed Wazuh Manager version, service health, and registered agents.
+* **Purpose:** Upgrade base OS packages, expand the root filesystem, create a 4 GB swap file, and tune OpenSearch kernel memory parameters.
 
 ```bash
-/var/ossec/bin/wazuh-control info
-systemctl status wazuh-manager wazuh-indexer wazuh-dashboard filebeat --no-pager
-/var/ossec/bin/agent_control -l
+# 1. Update all RHEL 9.8 packages
+dnf clean all
+dnf makecache
+dnf upgrade -y
+
+# 2. Expand root partition if underlying AWS EBS volume was resized (e.g., to 100 GB)
+dnf install -y cloud-utils-growpart
+growpart /dev/nvme0n1 4 || true
+xfs_growfs /
+
+# 3. Create and enable a persistent 4 GB Swap file
+if ! swapon --show | grep -q '/swapfile'; then
+    fallocate -l 4G /swapfile
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
+# 4. Configure required kernel parameters for Wazuh Indexer (OpenSearch)
+cat << 'EOF' > /etc/sysctl.d/99-wazuh.conf
+vm.max_map_count=262144
+vm.swappiness=10
+EOF
+sysctl --system
 ```
 
-* **Validation:** `wazuh-control info` shows `WAZUH_VERSION="v4.14.9"`, all four services show `active (running)`, and `agent_control -l` lists your monitored agent (`Active`).
+* **Validation:**
+```bash
+df -h /
+free -m
+sysctl vm.max_map_count
+```
+* **Expected output (reference only):**
+```text
+/dev/nvme0n1p4   99G  2.5G   97G   3% /
+Swap:           4095         0      4095
+vm.max_map_count = 262144
+```
 
-### 3.2 Inspect Monitored Agent Installation, Users, SSHD, and VNC State
+### 4.2 Install Required Packages, Configure DNF Timeouts, and Open Firewall Ports
 
-* **Location:** Wazuh Agent (`vnc-server`)
+* **Location:** Wazuh Manager (`172.31.7.137`)
 * **Execution user:** `root`
-* **Purpose:** Verify whether `wazuh-agent` is installed, inspect existing Linux users (`ec2-user`, `user1`–`user4`), and check active SSH/SFTP and TigerVNC settings.
+* **Purpose:** Install required shared libraries for the Indexer, Manager, and Dashboard, configure DNF network resiliency, and open ports `443`, `1514`, `1515`, and `55000` in `firewalld`.
 
 ```bash
-rpm -q wazuh-agent tigervnc-server openssh-server
+# 1. Increase DNF timeout so large RPM downloads (wazuh-indexer 836MB, wazuh-dashboard 286MB) never abort
+grep -q '^timeout=' /etc/dnf/dnf.conf || cat << 'EOF' >> /etc/dnf/dnf.conf
+timeout=300
+retries=10
+minrate=1000
+EOF
+
+# 2. Install required OS packages and shared libraries
+dnf install -y curl tar coreutils gnupg2 lsof libcap fontconfig nss openssl-libs policycoreutils-python-utils firewalld
+
+# 3. Enable firewalld and open required Wazuh server ports
+systemctl enable --now firewalld
+firewall-cmd --permanent --add-port={443/tcp,1514/tcp,1515/tcp,55000/tcp}
+firewall-cmd --reload
+```
+
+* **Validation:**
+```bash
+rpm -q curl tar lsof libcap fontconfig nss openssl-libs
+firewall-cmd --list-ports
+```
+* **Expected output (reference only):**
+```text
+443/tcp 1514/tcp 1515/tcp 55000/tcp
+```
+
+### 4.3 Add the Official Wazuh 4.x YUM Repository
+
+* **Location:** Wazuh Manager (`172.31.7.137`)
+* **Execution user:** `root`
+* **Purpose:** Import the Wazuh GPG signing key and configure `/etc/yum.repos.d/wazuh.repo`.
+
+```bash
+rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH
+
+cat << 'EOF' > /etc/yum.repos.d/wazuh.repo
+[wazuh]
+gpgcheck=1
+gpgkey=https://packages.wazuh.com/key/GPG-KEY-WAZUH
+enabled=1
+name=EL-$releasever - Wazuh
+baseurl=https://packages.wazuh.com/4.x/yum/
+protect=1
+EOF
+
+dnf makecache
+```
+
+* **Validation:**
+```bash
+dnf repolist --enabled | grep wazuh
+```
+* **Expected output (reference only):**
+```text
+wazuh                         EL-9 - Wazuh
+```
+
+### 4.4 Generate SSL Certificates and Install Wazuh Indexer, Manager, Filebeat, and Dashboard
+
+You can install the complete Wazuh v4.14.9 stack using the official Wazuh installation assistant step-by-step (which generates `wazuh-install-files.tar` containing all root CA, node SSL certificates, and random passwords, and installs each component without risking a full rollback if a network blip occurs).
+
+* **Location:** Wazuh Manager (`172.31.7.137`)
+* **Execution user:** `root`
+* **Purpose:** Generate X.509 certificates, install and initialize Wazuh Indexer, install Wazuh Manager and Filebeat, and install Wazuh Dashboard.
+
+```bash
+cd /root
+curl -sO https://packages.wazuh.com/4.14/wazuh-install.sh
+curl -sO https://packages.wazuh.com/4.14/config.yml
+chmod 700 /root/wazuh-install.sh
+
+# 1. Configure single-node IP topology in config.yml
+cat << 'EOF' > /root/config.yml
+nodes:
+  indexer:
+    - name: node-1
+      ip: "127.0.0.1"
+
+  server:
+    - name: wazuh-1
+      ip: "127.0.0.1"
+
+  dashboard:
+    - name: dashboard
+      ip: "127.0.0.1"
+EOF
+
+# 2. Generate SSL certificates and passwords archive (/root/wazuh-install-files.tar)
+bash /root/wazuh-install.sh --generate-config-files
+
+# 3. Install and start Wazuh Indexer
+bash /root/wazuh-install.sh --wazuh-indexer node-1 --ignore-check
+
+# 4. Initialize the Wazuh Indexer OpenSearch security cluster and internal users
+bash /root/wazuh-install.sh --start-cluster
+
+# 5. Install and start Wazuh Server (wazuh-manager + filebeat)
+bash /root/wazuh-install.sh --wazuh-server wazuh-1 --ignore-check
+
+# 6. Install and start Wazuh Dashboard (port 443/TCP)
+bash /root/wazuh-install.sh --wazuh-dashboard dashboard --ignore-check
+
+# 7. Back up the generated certificates and passwords archive and lock repo auto-updates
+cp -a /root/wazuh-install-files.tar /root/wazuh-install-files-backup.tar
+chmod 600 /root/wazuh-install-files.tar /root/wazuh-install-files-backup.tar
+sed -i "s/^enabled=1/enabled=0/" /etc/yum.repos.d/wazuh.repo
+```
+
+*(Note: Alternatively, `bash /root/wazuh-install.sh -a -i -v` runs steps 1–6 in a single command.)*
+
+### 4.5 Complete Wazuh Central Server Installation Validation
+
+* **Location:** Wazuh Manager (`172.31.7.137`)
+* **Execution user:** `root`
+* **Purpose:** Verify all four services, retrieve the initial `admin` password, validate Indexer cluster health (`9200`), Manager API (`55000`), and Dashboard HTTPS (`443`).
+
+```bash
+# 1. Verify systemd status of all four Wazuh server components
+systemctl is-active wazuh-indexer wazuh-manager filebeat wazuh-dashboard
+
+# 2. Extract and display the generated 'admin' password (store securely)
+ADMIN_PASS=$(tar -axf /root/wazuh-install-files.tar wazuh-install-files/wazuh-passwords.txt -O | awk '/indexer_username:[[:space:]]*'\''admin'\''/{getline; print $2}' | tr -d "'")
+echo "Wazuh Admin Username: admin"
+echo "Wazuh Admin Password: ${ADMIN_PASS}"
+
+# 3. Verify Wazuh Indexer API and Cluster Health (Port 9200)
+curl -sk -u "admin:${ADMIN_PASS}" https://127.0.0.1:9200/_cluster/health?pretty
+
+# 4. Verify Filebeat-to-Indexer TLS connectivity
+filebeat test output
+
+# 5. Verify Wazuh Manager API (Port 55000) and Dashboard HTTPS listener (Port 443)
+ss -lntp | grep -E ':(443|1514|1515|9200|55000)\b'
+curl -skI https://127.0.0.1:443/app/login | head -n 5
+```
+
+* **Expected output (reference only):**
+```text
+active
+active
+active
+active
+{
+  "cluster_name" : "wazuh-cluster",
+  "status" : "green",
+  "number_of_nodes" : 1,
+  "number_of_data_nodes" : 1
+}
+talk to server... OK
+HTTP/1.1 200 OK
+```
+
+---
+
+## 5. Wazuh Agent Installation (RHEL 9.8 and Compatible Linux Servers)
+
+This section provides the complete procedure to install `wazuh-agent-4.14.9-1` on any RHEL 9.8 server (including `vnc-server` at `172.31.9.50`).
+
+### 5.1 Configure the Wazuh Repository and Install the Wazuh Agent
+
+* **Location:** Wazuh Agent (`vnc-server` — `172.31.9.50`)
+* **Execution user:** `root`
+* **Purpose:** Add the Wazuh repository, install `wazuh-agent-4.14.9-1` configured with Manager IP `172.31.7.137` and agent name `vnc-server`, and disable automatic repo updates.
+
+```bash
+WAZUH_MANAGER_IP="172.31.7.137"
+WAZUH_AGENT_NAME="vnc-server"
+
+# 1. Import the Wazuh GPG key and configure the repository
+rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH
+
+cat << 'EOF' > /etc/yum.repos.d/wazuh.repo
+[wazuh]
+gpgcheck=1
+gpgkey=https://packages.wazuh.com/key/GPG-KEY-WAZUH
+enabled=1
+name=EL-$releasever - Wazuh
+baseurl=https://packages.wazuh.com/4.x/yum/
+protect=1
+EOF
+
+# 2. Install Wazuh Agent v4.14.9 with Manager IP and Agent Name pre-configured
+WAZUH_MANAGER="${WAZUH_MANAGER_IP}" WAZUH_AGENT_NAME="${WAZUH_AGENT_NAME}" dnf install -y wazuh-agent-4.14.9-1
+
+# 3. Disable repository auto-updates to keep agent version locked with the manager
+sed -i "s/^enabled=1/enabled=0/" /etc/yum.repos.d/wazuh.repo
+
+# 4. Set logcollector polling interval to 1 second for near-real-time event forwarding
+grep -q "logcollector.loop_timeout" /var/ossec/etc/local_internal_options.conf || \
+    echo "logcollector.loop_timeout=1" >> /var/ossec/etc/local_internal_options.conf
+```
+
+* **Validation:**
+```bash
+rpm -q wazuh-agent
+grep -E "<address>|<enrollment>" -A 2 /var/ossec/etc/ossec.conf
+```
+* **Expected output (reference only):**
+```text
+wazuh-agent-4.14.9-1.x86_64
+      <address>172.31.7.137</address>
+```
+
+---
+
+## 6. Agent Registration and Connectivity Verification
+
+### 6.1 Verify Firewall Connectivity and Start the Wazuh Agent
+
+* **Location:** Wazuh Agent (`vnc-server` — `172.31.9.50`)
+* **Execution user:** `root`
+* **Purpose:** Verify outbound TCP connectivity to `172.31.7.137` on ports `1514` and `1515`, then enable and start `wazuh-agent`.
+
+```bash
+WAZUH_MANAGER_IP="172.31.7.137"
+
+# 1. Test TCP connectivity to Wazuh Manager ports 1514 (events) and 1515 (enrollment)
+timeout 3 bash -c "</dev/tcp/${WAZUH_MANAGER_IP}/1514 && echo 'Port 1514/TCP: REACHABLE'"
+timeout 3 bash -c "</dev/tcp/${WAZUH_MANAGER_IP}/1515 && echo 'Port 1515/TCP: REACHABLE'"
+
+# 2. Enable and start wazuh-agent
+systemctl daemon-reload
+systemctl enable --now wazuh-agent
+sleep 5
+
+# 3. Verify key enrollment and server connection in Agent log
 systemctl status wazuh-agent --no-pager
-getent passwd ec2-user user1 user2 user3 user4
-getent group sftp-allowed sftp-denied
-sshd -T | grep -E "loglevel|syslogfacility|subsystem|denygroups"
-ls -la /etc/ssh/sshd_config.d/
+ls -l /var/ossec/etc/client.keys
+grep -E "Valid key received|Connected to the server" /var/ossec/logs/ossec.log | tail -n 5
 ```
 
-* **Validation:** Confirms whether `wazuh-agent` is installed and connected, lists UIDs/groups for `ec2-user` and `user1`–`user4`, and displays the active `sshd` configuration.
+* **Expected output (reference only):**
+```text
+Port 1514/TCP: REACHABLE
+Port 1515/TCP: REACHABLE
+wazuh-agentd: INFO: Valid key received
+wazuh-agentd: INFO: Connected to the server ([172.31.7.137]:1514/tcp).
+```
+
+### 6.2 Verify Agent Registration on the Wazuh Manager
+
+* **Location:** Wazuh Manager (`172.31.7.137`)
+* **Execution user:** `root`
+* **Purpose:** Confirm that `vnc-server` (`172.31.9.50`) is registered and `Active`.
+
+```bash
+/var/ossec/bin/agent_control -l
+/var/ossec/bin/agent_control -i 001
+```
+
+* **Expected output (reference only):**
+```text
+Wazuh agent_control. List of available agents:
+   ID: 000, Name: ec2-user (server), IP: 127.0.0.1, Active/Local
+   ID: 001, Name: vnc-server, IP: any, Active
+```
 
 ---
 
-## 4. Backup and Recovery Preparation
+## 7. Integrating Your Existing RHEL 9.8 TigerVNC & SFTP Server (`172.31.9.50`)
 
-Back up all existing configuration files on both servers before applying fixes.
+Your `vnc-server` (`172.31.9.50`) already runs GNOME, TigerVNC (`:1=user1`, `:2=user2`, `:3=user3`, `:4=user4`), SELinux in `Enforcing` mode, `firewalld`, and SFTP chroot directories (`/srv/sftp/user1/files`, `/srv/sftp/user2/files`) with groups `sftp-allowed` (`user1`, `user2`) and `sftp-denied` (`user3`, `user4`).
 
-### 4.1 Back Up Wazuh Manager Configuration Files
+Do **not** reinstall GNOME, TigerVNC, or recreate existing users. Instead, back up your existing configuration files and configure `/var/ossec/etc/ossec.conf` on `vnc-server` so all log sources are collected without duplicate `journald` ingestion.
 
-* **Location:** Wazuh Manager (`ec2-user`)
+### 7.1 Back Up Existing Agent Server Configurations
+
+* **Location:** Wazuh Agent (`vnc-server` — `172.31.9.50`)
 * **Execution user:** `root`
-* **Purpose:** Create a timestamped backup of all Wazuh Manager configs, rules, decoders, integrations, and Postfix files.
-
-```bash
-BACKUP_DIR="/root/wazuh_manager_backup_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$BACKUP_DIR"
-
-cp -a /var/ossec/etc/ossec.conf "$BACKUP_DIR/"
-cp -a /var/ossec/etc/decoders "$BACKUP_DIR/"
-cp -a /var/ossec/etc/rules "$BACKUP_DIR/"
-cp -a /var/ossec/integrations "$BACKUP_DIR/"
-[ -f /var/ossec/etc/email_notification_policy.json ] && cp -a /var/ossec/etc/email_notification_policy.json "$BACKUP_DIR/"
-[ -d /etc/postfix ] && cp -a /etc/postfix "$BACKUP_DIR/"
-
-ls -la "$BACKUP_DIR"
-```
-
-* **Validation:** `ls -la "$BACKUP_DIR"` displays copies of `ossec.conf`, `decoders`, `rules`, `integrations`, and `postfix`.
-
-### 4.2 Back Up Wazuh Agent, SSHD, Auditd, and TigerVNC Configuration Files
-
-* **Location:** Wazuh Agent (`vnc-server`)
-* **Execution user:** `root`
-* **Purpose:** Create a timestamped backup of all SSHD, Auditd, Rsyslog, TigerVNC, and Wazuh Agent configurations.
+* **Purpose:** Back up existing SSHD, Auditd, TigerVNC, and Wazuh Agent configurations before applying monitoring integration.
 
 ```bash
 AGENT_BACKUP_DIR="/root/wazuh_agent_backup_$(date +%Y%m%d_%H%M%S)"
@@ -171,75 +479,13 @@ cp -a /etc/ssh/sshd_config.d "$AGENT_BACKUP_DIR/"
 ls -la "$AGENT_BACKUP_DIR"
 ```
 
-* **Validation:** `ls -la "$AGENT_BACKUP_DIR"` displays all backed-up directories and files.
+### 7.2 Deploy Clean `/var/ossec/etc/ossec.conf` on `vnc-server` (`172.31.9.50`)
 
----
+**Why This Step Is Essential:** The default Wazuh 4.14 agent config on RHEL 9 includes `<location>journald</location>` at the bottom. If `<location>/var/log/secure</location>` is also added without removing `journald`, every SSH and SFTP event is sent to the Wazuh Manager **twice**, causing duplicate alerts and false brute-force counts.
 
-## 5. Wazuh Manager Configuration
-
-Configure `/var/ossec/etc/ossec.conf` on the Wazuh Manager so that:
-1. Built-in `wazuh-maild` (`<email_notification>no</email_notification>`) is disabled to prevent duplicate plain-text emails.
-2. Only **one** `<integration>` block exists for `custom-html-email.py` (preventing `wazuh-integratord` from firing twice per alert).
-
-### 5.1 Configure Clean Integration Block in Manager `ossec.conf`
-
-* **Location:** Wazuh Manager (`ec2-user`)
+* **Location:** Wazuh Agent (`vnc-server` — `172.31.9.50`)
 * **Execution user:** `root`
-* **Purpose:** Ensure `ossec.conf` disables legacy `wazuh-maild` and registers `custom-html-email.py` once.
-
-```bash
-cp /var/ossec/etc/ossec.conf /var/ossec/etc/ossec.conf.pre_fix
-
-# 1. Disable legacy plain-text wazuh-maild and remove any old <email_alerts> or duplicate <integration> blocks
-sed -i 's|<email_notification>yes</email_notification>|<email_notification>no</email_notification>|g' /var/ossec/etc/ossec.conf
-sed -i '/<email_alerts>/,/<\/email_alerts>/d' /var/ossec/etc/ossec.conf
-sed -i '/<integration>/,/<\/integration>/d' /var/ossec/etc/ossec.conf
-
-# 2. Insert a single clean <integration> block before the first </ossec_config>
-sed -i '0,/<\/ossec_config>/s|<\/ossec_config>|  <integration>\n    <name>custom-html-email.py</name>\n    <group>authentication_success,sftp_session,notify_sftp_connect,notify_sftp_transfer,notify_sftp_denied,notify_ssh_bruteforce,notify_ssh_suspicious,notify_user_mgmt,notify_group_mgmt,notify_vnc,notify_fim,notify_other,</group>\n    <alert_format>json</alert_format>\n  </integration>\n\n</ossec_config>|' /var/ossec/etc/ossec.conf
-
-/var/ossec/bin/wazuh-analysisd -t
-```
-
-* **Validation:** Run `grep -n -C 5 "custom-html-email.py" /var/ossec/etc/ossec.conf` and verify only one `<integration>` block exists and `wazuh-analysisd -t` returns no errors.
-
----
-
-## 6. Wazuh Agent Installation and Configuration
-
-Ensure the Wazuh Agent (`v4.14.9`) is installed on `vnc-server`, enrolled with `<WAZUH_MANAGER_IP>`, and configured to collect all required log sources without duplication.
-
-### 6.1 Install or Verify Wazuh Agent v4.14.9
-
-* **Location:** Wazuh Agent (`vnc-server`)
-* **Execution user:** `root`
-* **Purpose:** Install Wazuh Agent v4.14.9 (if not yet installed) and connect it to `<WAZUH_MANAGER_IP>`.
-
-```bash
-WAZUH_MANAGER_IP="172.31.7.137"
-WAZUH_AGENT_NAME="vnc-server"
-
-rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH
-
-if ! rpm -q wazuh-agent >/dev/null 2>&1; then
-    curl -sO https://packages.wazuh.com/4.x/yum/wazuh-agent-4.14.9-1.x86_64.rpm
-    WAZUH_MANAGER="${WAZUH_MANAGER_IP}" WAZUH_AGENT_NAME="${WAZUH_AGENT_NAME}" rpm -Uvh wazuh-agent-4.14.9-1.x86_64.rpm
-    rm -f wazuh-agent-4.14.9-1.x86_64.rpm
-fi
-
-grep -q "logcollector.loop_timeout" /var/ossec/etc/local_internal_options.conf || \
-    echo "logcollector.loop_timeout=1" >> /var/ossec/etc/local_internal_options.conf
-```
-
-* **Validation:** `rpm -q wazuh-agent` outputs `wazuh-agent-4.14.9-1.x86_64`.
-
-### 6.2 Configure Agent `/var/ossec/etc/ossec.conf` (Eliminating `journald` + `/var/log/secure` Double Ingestion)
-
-**Critical Root-Cause Fix:** Default Wazuh 4.14 installations on RHEL 9 include `<location>journald</location>` at the bottom of `ossec.conf`. If you also add `<location>/var/log/secure</location>` without removing `journald`, **every single SSH and SFTP log line is sent to the Wazuh Manager twice** (once via `journald` and once via `/var/log/secure`). That causes 3 failed logins to count as 6, and triggers duplicate alerts! The configuration below uses `/var/log/secure`, `/var/log/messages`, `/var/log/audit/audit.log`, and TigerVNC log globs cleanly without `journald` duplication.
-
-* **Location:** Wazuh Agent (`vnc-server`)
-* **Execution user:** `root`
-* **Purpose:** Configure complete, non-duplicated log collection and real-time Whodata File Integrity Monitoring (FIM).
+* **Purpose:** Configure non-duplicated log collection (`/var/log/secure`, `/var/log/audit/audit.log`, `/var/log/messages`, and TigerVNC logs) and real-time Whodata FIM.
 
 ```bash
 WAZUH_MANAGER_IP="172.31.7.137"
@@ -411,25 +657,30 @@ EOF
 
 chown root:wazuh /var/ossec/etc/ossec.conf
 chmod 660 /var/ossec/etc/ossec.conf
-systemctl enable --now wazuh-agent
 systemctl restart wazuh-agent
 ```
 
-* **Validation:** Run `grep "Connected to the server" /var/ossec/logs/ossec.log | tail -n 2` to verify connection to `<WAZUH_MANAGER_IP>`.
+* **Validation:**
+```bash
+grep "Analyzing file" /var/ossec/logs/ossec.log | tail -n 10
+```
 
 ---
 
-## 7. Linux Authentication and Auditd Monitoring
+## 8. Linux User Monitoring (Existing and Newly Created Accounts)
 
-Configure Linux kernel `auditd` rules on `vnc-server` so every command run by any user (`auid >= 1000`), every user/group modification (`useradd`, `usermod`, `userdel`, `passwd`, `gpasswd`), and every SSH/TigerVNC configuration edit is recorded in `/var/log/audit/audit.log`.
+To monitor every Linux account (`ec2-user`, `user1`–`user4`, and any future employee account created with `useradd`) without hardcoding usernames, configure kernel `auditd` rules on `vnc-server` (`172.31.9.50`).
 
-### 7.1 Configure Kernel `auditd` Rules for All Users
+### 8.1 Configure Kernel `auditd` Rules on `vnc-server` (`172.31.9.50`)
 
-* **Location:** Wazuh Agent (`vnc-server`)
+* **Location:** Wazuh Agent (`vnc-server` — `172.31.9.50`)
 * **Execution user:** `root`
-* **Purpose:** Load comprehensive `auditd` rules for all interactive UIDs ($\ge 1000$) and system identity files.
+* **Purpose:** Track all commands executed by any human user (`auid >= 1000`), user account creation/deletion, group membership changes, SSHD edits, and TigerVNC config edits.
 
 ```bash
+dnf install -y audit
+systemctl enable --now auditd
+
 rm -f /etc/audit/rules.d/wazuh-command-audit.rules
 mkdir -p /etc/tigervnc /etc/firewalld /etc/NetworkManager/system-connections /etc/ssh/sshd_config.d
 
@@ -437,16 +688,16 @@ cat << 'EOF' > /etc/audit/rules.d/wazuh-full-monitoring.rules
 -D
 -b 8192
 
-## 1. Track all commands executed by any human user (auid >= 1000)
+## 1. Track all commands executed by any human user (auid >= 1000) including root escalation
 -a always,exit -F arch=b64 -S execve -F auid>=1000 -F auid!=-1 -k audit-wazuh-c
 -a always,exit -F arch=b32 -S execve -F auid>=1000 -F auid!=-1 -k audit-wazuh-c
 
-## 2. Track user account and password modifications
+## 2. Track user creation, modification, deletion, and password changes
 -w /etc/passwd -p wa -k user-modify
 -w /etc/shadow -p wa -k user-modify
 -w /etc/security/opasswd -p wa -k user-modify
 
-## 3. Track group membership modifications
+## 3. Track group creation and membership changes (sftp-allowed / sftp-denied)
 -w /etc/group -p wa -k group-modify
 -w /etc/gshadow -p wa -k group-modify
 
@@ -468,45 +719,44 @@ EOF
 augenrules --load
 ```
 
-* **Validation:** Run `auditctl -l` and verify all 15 rules are active in the kernel.
+* **Validation:**
+```bash
+auditctl -l
+```
+* **Expected output (reference only):**
+```text
+-a always,exit -F arch=b64 -S execve -F auid>=1000 -F auid!=-1 -F key=audit-wazuh-c
+-a always,exit -F arch=b32 -S execve -F auid>=1000 -F auid!=-1 -F key=audit-wazuh-c
+-w /etc/passwd -p wa -k user-modify
+...
+```
 
 ---
 
-## 8. SSH Monitoring Configuration
+## 9. SSH Monitoring Configuration
 
-### 8.1 Why SSH Brute-Force Failed for `ec2-user` and `user3` Previously
+### 9.1 Fix `/etc/ssh/sshd_config.d/40-sftp-access.conf` for Complete SSH & SFTP Visibility
 
-1. **`ec2-user` Passwordless Rejection:** In your previous test (`ssh ec2-user@172.31.15.62`), `ec2-user` did not have a Linux password set, or the client did not offer password authentication (`Permission denied (publickey,gssapi-keyex,gssapi-with-mic)`). When SSH closes during `[preauth]` without a password prompt, OpenSSH logs `Connection closed by authenticating user ec2-user ... [preauth]` (Rule `5722`, Level 0), **not** `Failed password`.
-2. **`user3` (`sftp-denied`) Blocked Before Password Prompt:** In your `/etc/ssh/sshd_config.d/40-sftp-access.conf`, you had `DenyGroups sftp-denied` AND `Match Group sftp-denied` with `PasswordAuthentication no`. Because `PasswordAuthentication no` was set for `sftp-denied`, OpenSSH never prompted `user3` for a password and immediately rejected the connection at `[preauth]`.
-3. **Fix:**
-   * Keep `LogLevel VERBOSE` and `Subsystem sftp internal-sftp -f AUTHPRIV -l INFO` globally at the top of `/etc/ssh/sshd_config.d/40-sftp-access.conf`.
-   * For `Match Group sftp-denied`, use `ForceCommand /usr/sbin/nologin` (instead of `DenyGroups` + `PasswordAuthentication no`) so that:
-     * If an attacker brute-forces `user3`'s password, OpenSSH logs `Failed password for user3` and triggers the 5-attempt / 10-attempt SSH Brute-Force alert!
-     * If `user3` enters their valid password to attempt SFTP or SSH, OpenSSH logs `Starting session: forced-command (config) '/usr/sbin/nologin' for user3 from <IP>` and immediately disconnects them, triggering **Rule `100505` (`[HIGH] SFTP Access Denied`)** with `user3`'s exact username and source IP!
+In your previous setup on `vnc-server` (`172.31.9.50`), `/etc/ssh/sshd_config.d/40-sftp-access.conf` had three issues:
+1. `LogLevel VERBOSE` was missing.
+2. `ForceCommand internal-sftp` did not include `-f AUTHPRIV -l INFO`, so `internal-sftp` never logged file opens, closes, or deletions.
+3. `DenyGroups sftp-denied` and `PasswordAuthentication no` under `Match Group sftp-denied` rejected `user3` and `user4` before a password prompt could occur. By removing `DenyGroups` and setting `PasswordAuthentication yes` + `ForceCommand /usr/sbin/nologin` under `Match Group sftp-denied`, `user3` and `user4` remain completely blocked from SSH and SFTP, while both password brute-force attempts (`Failed password`) and unauthorized SFTP attempts (`forced-command (config) '/usr/sbin/nologin' for user3`) are logged with the exact username and source IP!
 
-### 8.2 Configure `/etc/ssh/sshd_config.d/40-sftp-access.conf`
-
-* **Location:** Wazuh Agent (`vnc-server`)
+* **Location:** Wazuh Agent (`vnc-server` — `172.31.9.50`)
 * **Execution user:** `root`
-* **Purpose:** Configure global verbose SSH/SFTP logging, chroot SFTP for `sftp-allowed`, and audited denial for `sftp-denied`.
+* **Purpose:** Configure verbose SSH/SFTP logging for all users, chroot SFTP for `sftp-allowed`, and audited SFTP/SSH denial for `sftp-denied`.
 
 ```bash
-# 1. Remove any competing drop-in file we created earlier so there is only ONE authoritative file
 rm -f /etc/ssh/sshd_config.d/50-sftp-monitoring.conf
-
-# 2. Comment out legacy Subsystem sftp in main /etc/ssh/sshd_config
 sed -i 's/^[[:space:]]*Subsystem[[:space:]]\+sftp/#Subsystem sftp/g' /etc/ssh/sshd_config
 
-# 3. Write authoritative /etc/ssh/sshd_config.d/40-sftp-access.conf
 cat << 'EOF' > /etc/ssh/sshd_config.d/40-sftp-access.conf
-# Global Verbose SSH & SFTP Logging for ALL Users
 LogLevel VERBOSE
 SyslogFacility AUTHPRIV
 PasswordAuthentication yes
 KbdInteractiveAuthentication yes
 Subsystem sftp internal-sftp -f AUTHPRIV -l INFO -u 0022
 
-# SFTP-Allowed Users (Chrooted to /srv/sftp/%u with verbose file transfer logging)
 Match Group sftp-allowed
     PasswordAuthentication yes
     ChrootDirectory /srv/sftp/%u
@@ -515,7 +765,6 @@ Match Group sftp-allowed
     X11Forwarding no
     PermitTTY no
 
-# SFTP-Denied Users (VNC-only accounts: logs failed passwords AND logs/blocks SFTP/SSH access)
 Match Group sftp-denied
     PasswordAuthentication yes
     ForceCommand /usr/sbin/nologin
@@ -529,123 +778,37 @@ sshd -t && systemctl reload sshd
 ```
 
 * **Validation:**
-  ```bash
-  sshd -T -C user=user1,host=localhost,addr=127.0.0.1 | grep -E '^(loglevel|chrootdirectory|forcecommand|subsystem)'
-  sshd -T -C user=user3,host=localhost,addr=127.0.0.1 | grep -E '^(loglevel|chrootdirectory|forcecommand|passwordauthentication)'
-  ```
+```bash
+sshd -T -C user=user1,host=localhost,addr=127.0.0.1 | grep -E '^(loglevel|chrootdirectory|forcecommand)'
+sshd -T -C user=user3,host=localhost,addr=127.0.0.1 | grep -E '^(loglevel|chrootdirectory|forcecommand|passwordauthentication)'
+```
+* **Expected output (reference only):**
+```text
+loglevel VERBOSE
+forcecommand internal-sftp -f AUTHPRIV -l INFO -u 0022
+chrootdirectory /srv/sftp/%u
+loglevel VERBOSE
+passwordauthentication yes
+forcecommand /usr/sbin/nologin
+chrootdirectory none
+```
 
 ---
 
-## 9. SFTP Monitoring (Fixing Chroot Logging & `ec2-user` Misattribution)
+## 10. SFTP Monitoring (Chroot `/dev/log` Socket & Automatic New User Provisioning)
 
-### 9.1 Root Cause of Two Critical SFTP Issues
+### 10.1 Why Chrooted SFTP Users (`user1`, `user2`) Require `/srv/sftp/<user>/dev/log`
 
-1. **Why Chrooted SFTP (`user1`, `user2`) Produced Zero File Logs:**
-   When `sshd` chroots `user1` into `/srv/sftp/user1`, the `internal-sftp` process can no longer access `/dev/log` on the host filesystem unless a UNIX datagram socket exists at `/srv/sftp/user1/dev/log`. Without it, `session opened`, `open`, `close`, and `remove` logs are silently discarded by libc `syslog()`.
-2. **Why an SFTP Action by Another User Was Reported as `ec2-user`:**
-   Look at `/var/ossec/etc/ossec.conf` on your agent: `<syscheck>` monitors `/home` and `/srv/sftp` with `whodata="yes"` (Rule `550` / `554`). When an administrator is logged in via SSH as `ec2-user` and runs `sudo su -` to create files or test SFTP locally from the same box, the Linux kernel's Immutable Login UID (`auid`) remains `1000` (`ec2-user`) across `sudo`/`su` transitions! Furthermore, in our previous rule `100502`, `<group>syscheck,sftp_transfer...</group>` included the `syscheck` group, and in `custom-html-email.py`, `syscheck.audit.user.name` (`auid`) was checked when `data.dstuser` was empty on an SFTP `open` line!
-   * **Fix:**
-     * Configure `rsyslog` with `$AddUnixListenSocket /srv/sftp/<user>/dev/log` (or bind-mount `/run/systemd/journal/dev-log`) so chrooted `internal-sftp` writes real `open` and `close` logs to `/var/log/secure`.
-     * Remove `syscheck` from the `<group>` tag of SFTP rules `100502` and `100504`.
-     * In `custom-html-email.py`, resolve the SFTP username strictly from the `sshd[PID]` session cache (`session opened for local user <username> from [<srcip>]`) or file path, **never** from an unrelated `auid` (`ec2-user`).
+When OpenSSH chroots `user1` into `/srv/sftp/user1`, the `internal-sftp` process can no longer reach the host's `/dev/log` socket unless `/run/systemd/journal/dev-log` is bind-mounted at `/srv/sftp/user1/dev/log`.
 
-### 9.2 Configure Chroot `/dev/log` Sockets for Existing Users (`user1`, `user2`)
+### 10.2 Configure Chroot `/dev/log` Sockets for Existing Users (`user1`, `user2`) and Create Helper Script for Future Users
 
-* **Location:** Wazuh Agent (`vnc-server`)
+* **Location:** Wazuh Agent (`vnc-server` — `172.31.9.50`)
 * **Execution user:** `root`
-* **Purpose:** Bind-mount `/run/systemd/journal/dev-log` into `/srv/sftp/user1/dev/log` and `/srv/sftp/user2/dev/log` so chrooted `internal-sftp` processes log every file transfer to `/var/log/secure`.
+* **Purpose:** Bind-mount `/run/systemd/journal/dev-log` into `/srv/sftp/user1/dev/log` and `/srv/sftp/user2/dev/log`, and create `/usr/local/sbin/setup-sftp-chroot-user.sh` for future `sftp-allowed` accounts.
 
 ```bash
-for u in user1 user2; do
-    mkdir -p /srv/sftp/$u/dev /srv/sftp/$u/files
-    chown root:root /srv /srv/sftp /srv/sftp/$u /srv/sftp/$u/dev
-    chmod 755 /srv /srv/sftp /srv/sftp/$u /srv/sftp/$u/dev
-    chown $u:sftp-allowed /srv/sftp/$u/files
-    chmod 700 /srv/sftp/$u/files
-
-    touch /srv/sftp/$u/dev/log
-    if ! mountpoint -q /srv/sftp/$u/dev/log && ! grep -q "/srv/sftp/$u/dev/log" /proc/mounts; then
-        mount --bind /run/systemd/journal/dev-log /srv/sftp/$u/dev/log
-    fi
-    grep -q "/srv/sftp/$u/dev/log" /etc/fstab || \
-        echo "/run/systemd/journal/dev-log /srv/sftp/$u/dev/log none bind 0 0" >> /etc/fstab
-done
-
-semanage fcontext -a -t user_home_t "/srv/sftp/[^/]+/files(/.*)?" 2>/dev/null || true
-restorecon -Rv /srv/sftp
-setsebool -P ssh_chroot_rw_homedirs on
-systemctl restart rsyslog
-```
-
-* **Validation:** Run `grep "/srv/sftp" /proc/mounts` and confirm both `/srv/sftp/user1/dev/log` and `/srv/sftp/user2/dev/log` are active mounts.
-
----
-
-## 10. TigerVNC Monitoring (Architecture, Limitations, and Attribution)
-
-### 10.1 How TigerVNC Authenticates in Your Current Configuration
-
-In your setup (`/etc/tigervnc/vncserver-config-defaults`), TigerVNC is configured with:
-```ini
-session=gnome
-geometry=1920x1080
-securitytypes=vncauth,tlsvnc
-```
-And displays are mapped in `/etc/tigervnc/vncserver.users`:
-* `:1=user1` (Port `5901`)
-* `:2=user2` (Port `5902`)
-* `:3=user3` (Port `5903`)
-* `:4=user4` (Port `5904`)
-
-### 10.2 Important Technical Limitation & How We Solve User Attribution
-
-1. **Systemd Service Startup (`pam_unix(tigervnc:session)`):** When `systemctl start vncserver@:1.service` starts, `/var/log/secure` logs:
-   `pam_unix(tigervnc:session): session opened for user user1(uid=1001) by (uid=0)`
-   This identifies the **Linux username (`user1`)** and **UID (`1001`)** when the VNC desktop starts or stops, but does **not** include the remote VNC client's IP address.
-2. **VNC Client Network Connection (`Xvnc` Log):** Because `securitytypes=vncauth,tlsvnc` uses each user's `/home/<user>/.config/tigervnc/passwd` (8-byte VNC password) rather than Linux PAM, client connections are logged inside the user's VNC log file:
-   `/home/<username>/.local/share/tigervnc/<hostname>:<display>.log` (on RHEL 9 TigerVNC 1.15)
-   * Connection accepted: `Connections: accepted: <CLIENT_IP>::<PORT>`
-   * Authentication failed: `Connections: closed: <CLIENT_IP>::<PORT> (AuthFailureException: Authentication failure)`
-   * Session closed: `Connections: closed: <CLIENT_IP>::<PORT> (Clean disconnection)`
-3. **How Wazuh Attributes the Exact Linux Username and Display:**
-   Because Wazuh Agent collects `/home/*/.local/share/tigervnc/*.log`, every alert generated from that log file carries the exact file path in the JSON alert metadata (`"location": "/home/user1/.local/share/tigervnc/vnc-server:1.log"`). Our custom decoders extract the **Source IP (`srcip`)** from `Connections: accepted/closed`, and our integration script (`custom-html-email.py`) extracts the **Linux Username (`user1`)** and **VNC Display (`:1`)** directly from the `location` path!
-
-### 10.3 Ensure TigerVNC Log Permissions Allow Wazuh Agent Collection
-
-* **Location:** Wazuh Agent (`vnc-server`)
-* **Execution user:** `root`
-* **Purpose:** Verify TigerVNC log files exist under `/home/<user>/.local/share/tigervnc/` and restart `wazuh-agent` so wildcard log collection attaches to them.
-
-```bash
-ls -la /home/*/.local/share/tigervnc/*.log 2>/dev/null || ls -la /home/*/.vnc/*.log 2>/dev/null
-systemctl restart wazuh-agent
-```
-
-* **Validation:** `grep "tigervnc" /var/ossec/logs/ossec.log` shows `Analyzing file: '/home/user1/.local/share/tigervnc/vnc-server:1.log'` for each active VNC user.
-
----
-
-## 11. Automatic Monitoring of Newly Created Linux Users
-
-### 11.1 How New Users Are Monitored Automatically
-
-1. **Standard SSH & Non-Chroot SFTP Users (`useradd -m -s /bin/bash newuser5`):**
-   * Automatically monitored **immediately** with zero extra commands.
-   * SSH logins/failures log to `/var/log/secure`.
-   * SFTP transfers log via global `Subsystem sftp internal-sftp -f AUTHPRIV -l INFO -u 0022` to `/var/log/secure`.
-   * Commands executed log via kernel `auditd` (`auid >= 1000`) to `/var/log/audit/audit.log`.
-2. **SFTP-Denied Users (`useradd -m -s /bin/bash -G sftp-denied newuser6`):**
-   * Automatically monitored **immediately** with zero extra commands.
-3. **Chrooted SFTP-Allowed Users (`useradd -m -s /bin/bash -G sftp-allowed newuser7`):**
-   * Because OpenSSH `ChrootDirectory /srv/sftp/%u` requires a root-owned `/srv/sftp/<username>` directory and a `/srv/sftp/<username>/dev/log` socket, we install a lightweight helper script (`/usr/local/sbin/setup-sftp-chroot-user.sh`) so provisioning any future chrooted SFTP user takes one command.
-
-### 11.2 Create the Helper Script for Future Chrooted SFTP Users
-
-* **Location:** Wazuh Agent (`vnc-server`)
-* **Execution user:** `root`
-* **Purpose:** Create `/usr/local/sbin/setup-sftp-chroot-user.sh` to automatically set up the chroot directory, SELinux context, and `/dev/log` mount for any new `sftp-allowed` user.
-
-```bash
+# 1. Create reusable helper script for any existing or future sftp-allowed user
 cat << 'EOF' > /usr/local/sbin/setup-sftp-chroot-user.sh
 #!/bin/bash
 set -e
@@ -670,29 +833,58 @@ grep -q "/srv/sftp/${USERNAME}/dev/log" /etc/fstab || \
     echo "/run/systemd/journal/dev-log /srv/sftp/${USERNAME}/dev/log none bind 0 0" >> /etc/fstab
 
 restorecon -Rv "/srv/sftp/${USERNAME}" >/dev/null 2>&1 || true
-echo "Chroot SFTP and Wazuh /dev/log socket configured for ${USERNAME}."
+echo "Configured chroot SFTP and /dev/log socket for ${USERNAME}."
 EOF
 
 chmod 750 /usr/local/sbin/setup-sftp-chroot-user.sh
+
+# 2. Apply to existing sftp-allowed users (user1 and user2)
+/usr/local/sbin/setup-sftp-chroot-user.sh user1
+/usr/local/sbin/setup-sftp-chroot-user.sh user2
+systemctl restart rsyslog
 ```
 
-* **Validation:** `ls -l /usr/local/sbin/setup-sftp-chroot-user.sh` shows `-rwxr-x---`.
+* **Validation:**
+```bash
+grep "/srv/sftp" /proc/mounts
+```
+* **Expected output (reference only):**
+```text
+/dev/nvme0n1p4 /srv/sftp/user1/dev/log xfs rw,seclabel,relatime,attr2,inode64,logbufs=8,logbsize=32k,prjquota 0 0
+/dev/nvme0n1p4 /srv/sftp/user2/dev/log xfs rw,seclabel,relatime,attr2,inode64,logbufs=8,logbsize=32k,prjquota 0 0
+```
 
 ---
 
-## 12. Custom Decoders
+## 11. TigerVNC Monitoring
 
-Create `/var/ossec/etc/decoders/sftp_decoders.xml` on the Wazuh Manager to decode:
-* SFTP session open/close (`sshd` and `sftp-server`)
-* SFTP file `open`, `close` (bytes read/written), `remove`, `rmdir`, `rename`, `setstat`
-* SFTP `forced-command` denials (`/usr/sbin/nologin` and `/usr/bin/false`)
-* TigerVNC `Xvnc` connection accepted, authentication failure, and disconnection logs (extracting `srcip` and `srcport`)
+### 11.1 How TigerVNC Logs Sessions on RHEL 9.8
 
-### 12.1 Deploy `/var/ossec/etc/decoders/sftp_decoders.xml`
+On RHEL 9.8 (`tigervnc-server-1.15`), each user's `Xvnc` process writes connection and authentication events to `/home/<user>/.local/share/tigervnc/<hostname>:<display>.log`:
+* `Connections: accepted: <CLIENT_IP>::<PORT>`
+* `Connections: closed: <CLIENT_IP>::<PORT> (AuthFailureException: Authentication failure)`
+* `Connections: closed: <CLIENT_IP>::<PORT> (Clean disconnection)`
 
-* **Location:** Wazuh Manager (`ec2-user`)
+Because `/var/ossec/etc/ossec.conf` on `vnc-server` (`Section 7.2`) collects `/home/*/.local/share/tigervnc/*.log`, Wazuh receives the log line along with the file path (`location`), allowing our integration script to identify both the **Linux username (`user1`–`user4`)** and **VNC display (`:1`–`:4`)** automatically.
+
+* **Location:** Wazuh Agent (`vnc-server` — `172.31.9.50`)
 * **Execution user:** `root`
-* **Purpose:** Install PCRE2 decoders for OpenSSH `internal-sftp`, SFTP access denials, and TigerVNC `Xvnc` logs.
+* **Purpose:** Verify that TigerVNC log files are being monitored by `wazuh-logcollector`.
+
+```bash
+ls -la /home/*/.local/share/tigervnc/*.log 2>/dev/null || ls -la /home/*/.vnc/*.log 2>/dev/null
+grep -E "tigervnc|\.vnc" /var/ossec/logs/ossec.log
+```
+
+---
+
+## 12. Custom Decoders and Rules
+
+### 12.1 Deploy Custom PCRE2 Decoders (`/var/ossec/etc/decoders/sftp_decoders.xml`)
+
+* **Location:** Wazuh Manager (`172.31.7.137`)
+* **Execution user:** `root`
+* **Purpose:** Decode OpenSSH `internal-sftp` sessions, file `open`, file `close` (bytes read/written), file delete/rename, `forced-command` denials, and TigerVNC `Xvnc` logs.
 
 ```bash
 cat << 'EOF' > /var/ossec/etc/decoders/sftp_decoders.xml
@@ -796,31 +988,11 @@ chown wazuh:wazuh /var/ossec/etc/decoders/sftp_decoders.xml
 chmod 660 /var/ossec/etc/decoders/sftp_decoders.xml
 ```
 
-* **Validation:** Run `/var/ossec/bin/wazuh-analysisd -t` and confirm zero syntax errors.
+### 12.2 Deploy Custom SFTP and TigerVNC Rules (`/var/ossec/etc/rules/sftp_and_vnc_rules.xml`)
 
----
-
-## 13. Custom Rules (SFTP & TigerVNC)
-
-### 13.1 Why Previously Uploading One File Sent 3 Duplicate Emails
-
-When `user1` uploaded a single file (`put chip.gds`), three events fired simultaneously:
-1. `Rule 100502`: `open "/files/chip.gds" flags WRITE,CREATE,TRUNCATE`
-2. `Rule 100507`: `close "/files/chip.gds" bytes read 0 written 46`
-3. `Rule 100512` (or `550`/`554`): Syscheck FIM file creation alert
-
-Because all three rules were in `notify_sftp_transfer`, Wazuh sent **3 emails for 1 file upload**!
-* **How We Fix It:**
-  * `Rule 100502` (file opened for writing) and `Rule 100503` (file opened for reading) are placed in `sftp_file_open` (logged to Dashboard, caches the operation type in our session tracker, **does not send a premature email**).
-  * `Rule 100507` (`close "..." bytes read X written Y`) is the **authoritative SFTP Transfer Completed alert (`notify_sftp_transfer`)** and sends **1 single email** per uploaded or downloaded file with the exact byte count!
-  * `Rule 100504` (`remove`, `rmdir`, `rename`) sends **1 email** when a file is deleted or renamed via SFTP.
-  * `Rule 100505` (user in `sftp-denied` blocked from SFTP) and `Rule 100508` (`Permission denied` during file upload/download) are in `notify_sftp_denied` and send **1 High-severity email**.
-
-### 13.2 Deploy `/var/ossec/etc/rules/sftp_and_vnc_rules.xml`
-
-* **Location:** Wazuh Manager (`ec2-user`)
+* **Location:** Wazuh Manager (`172.31.7.137`)
 * **Execution user:** `root`
-* **Purpose:** Configure clean, non-overlapping SFTP and TigerVNC rules.
+* **Purpose:** Create rules for SFTP session open/close (`100501`, `100511`), file open tracking (`100502`, `100503`), authoritative transfer completion (`100507`), file delete/rename (`100504`), unauthorized SFTP denial (`100505`), permission failure (`100508`), and TigerVNC activity (`100506`, `100509`, `100510`, `100513`).
 
 ```bash
 cat << 'EOF' > /var/ossec/etc/rules/sftp_and_vnc_rules.xml
@@ -915,30 +1087,23 @@ EOF
 
 chown wazuh:wazuh /var/ossec/etc/rules/sftp_and_vnc_rules.xml
 chmod 660 /var/ossec/etc/rules/sftp_and_vnc_rules.xml
+/var/ossec/bin/wazuh-analysisd -t
 ```
-
-* **Validation:** Run `/var/ossec/bin/wazuh-analysisd -t` and confirm zero errors.
 
 ---
 
-## 14. Brute-Force Correlation & SSH/Network Rules
+## 13. Brute-Force Detection (5-Attempt Medium & 10-Attempt High Correlation)
 
-### 14.1 How Wazuh Correlation, Frequency, Timeframe, and Hierarchy Work
+### 13.1 How the Two-Tier Brute-Force Rules Work
 
-1. **Why 2 Emails Fired Previously on Brute-Force:**
-   Previously, we had two separate rules at the same level: `100601` (`<same_source_ip />`) and `100602` (`<same_user />`). Because both rules matched `authentication_failed` independently, Wazuh evaluated the 5th failed login against `100601` (or `100602`), and then the 6th failed login matched the other rule, or both rules fired in the same batch.
-2. **Unified Correlation by `<same_source_ip />` with Dynamic `$(dstuser)`:**
-   By consolidating the 5-attempt Medium threshold into **one authoritative rule (`100601`, `frequency="5"`, `timeframe="300"`)** and the 10-attempt High threshold into **one authoritative rule (`100611`, `frequency="10"`, `timeframe="300"`)**—and placing `100611` **before** `100601` while keeping `authentication_failed` in `100601`'s `<group>` list—Wazuh counts every failed password attempt cleanly:
-   * **Attempts 1–4:** Match built-in `5716` / `5710` (Level 5, no email).
-   * **Attempt 5:** Matches `100601` (Level 8, **Medium Severity**) -> Sends **1 Medium Email**.
-   * **Attempts 6–9:** Match `100601` in Wazuh, suppressed by our integration deduplication guard -> **0 Emails**.
-   * **Attempt 10:** Matches `100611` (Level 12, **High Severity**, evaluated before `100601`) -> Sends **1 High Escalation Email**.
+* **Rule `100611` (High Severity — Level 12, `frequency="10"`, `timeframe="300"`):** Placed **before** Rule `100601` in `/var/ossec/etc/rules/ssh_and_network_rules.xml` so that when the 10th failed login within 5 minutes arrives, Wazuh evaluates and triggers the High-severity escalation rule first.
+* **Rule `100601` (Medium Severity — Level 8, `frequency="5"`, `timeframe="300"`):** Includes `authentication_failed` in its `<group>` list so that attempt #5 triggers the Medium alert while attempts #5–#9 remain in the `authentication_failed` correlation group for Rule `100611`.
 
-### 14.2 Deploy `/var/ossec/etc/rules/ssh_and_network_rules.xml`
+### 13.2 Deploy `/var/ossec/etc/rules/ssh_and_network_rules.xml`
 
-* **Location:** Wazuh Manager (`ec2-user`)
+* **Location:** Wazuh Manager (`172.31.7.137`)
 * **Execution user:** `root`
-* **Purpose:** Configure the 5-attempt Medium and 10-attempt High SSH brute-force rules, suspicious SSH login rules, user/group audit rules, and network rules.
+* **Purpose:** Configure 5-attempt Medium and 10-attempt High SSH brute-force detection, suspicious SSH login rules, user/group modification alerts, and network socket rules.
 
 ```bash
 cat << 'EOF' > /var/ossec/etc/rules/ssh_and_network_rules.xml
@@ -1099,21 +1264,18 @@ EOF
 
 chown wazuh:wazuh /var/ossec/etc/rules/ssh_and_network_rules.xml
 chmod 660 /var/ossec/etc/rules/ssh_and_network_rules.xml
+/var/ossec/bin/wazuh-analysisd -t
 ```
-
-* **Validation:** Run `/var/ossec/bin/wazuh-analysisd -t` and confirm zero errors.
 
 ---
 
-## 15. Email Notification Policy
+## 14. Email Notification Management Policy
 
-All security events remain visible in the Wazuh Dashboard. Email notifications are controlled by `/var/ossec/etc/email_notification_policy.json`.
+### 14.1 Create `/var/ossec/etc/email_notification_policy.json`
 
-### 15.1 Create `/var/ossec/etc/email_notification_policy.json`
-
-* **Location:** Wazuh Manager (`ec2-user`)
+* **Location:** Wazuh Manager (`172.31.7.137`)
 * **Execution user:** `root`
-* **Purpose:** Configure default enabled email categories (SFTP transfers, SFTP denied/failed, and SSH brute-force) and disable noisy categories by default.
+* **Purpose:** Enable emails by default only for SFTP file transfers (`sftp_successful_transfers`), SFTP denied/failed operations (`sftp_failed_denied_operations`), and SSH brute-force detection (`ssh_bruteforce_detection`), while keeping all other categories configurable.
 
 ```bash
 cat << 'EOF' > /var/ossec/etc/email_notification_policy.json
@@ -1144,43 +1306,30 @@ chown root:wazuh /var/ossec/etc/email_notification_policy.json
 chmod 660 /var/ossec/etc/email_notification_policy.json
 ```
 
-* **Validation:** `cat /var/ossec/etc/email_notification_policy.json` displays the JSON policy.
-
 ---
 
-## 16. Duplicate Email Prevention Architecture
+## 15. Postfix and Gmail SMTP Setup
 
-Our notification engine (`/var/ossec/integrations/custom-html-email.py`) prevents duplicate emails using four mechanisms:
-1. **File Lock Serialization (`fcntl.flock`):** When multiple events arrive in the same millisecond, `wazuh-integratord` spawns concurrent processes. An exclusive file lock (`/var/ossec/tmp/sftp_session_cache.lock`) ensures two processes never race or send duplicate emails simultaneously.
-2. **Incident Fingerprint Identification:**
-   * **Brute-Force Medium (`Rule 100601`):** Keyed by `bf:MEDIUM:<agent_id>:<srcip>:<dstuser>` with a `300s` (5-minute) cooldown. Attempts #6–#9 are suppressed after Attempt #5 sends the Medium email.
-   * **Brute-Force High (`Rule 100611`):** Keyed by `bf:HIGH:<agent_id>:<srcip>:<dstuser>` with a `300s` cooldown. Because its tier is `HIGH`, Attempt #10 is **not** blocked by the earlier `MEDIUM` cooldown and sends 1 High Escalation email immediately.
-   * **SFTP File Transfer (`Rule 100507` / `100504`):** Keyed by `sftp:<agent_id>:<dstuser>:<operation>:<file_path>` with a `15s` cooldown so a single file transfer only sends **1 email**, while uploading a different file or another user uploading a file is never suppressed.
-   * **SFTP Access Denied (`Rule 100505` / `100508`):** Keyed by `denied:<agent_id>:<dstuser>:<srcip>:<rule_id>` with a `60s` cooldown to prevent notification storms if an SFTP client auto-retries a blocked connection.
+Configure Postfix on the Wazuh Manager (`172.31.7.137`) to relay alert emails via `smtp.gmail.com:587` using `devops.jakir@gmail.com` and a 16-character Google App Password.
 
----
+### 15.1 Install and Configure Postfix STARTTLS Relay
 
-## 17. Postfix Installation and Gmail SMTP Configuration
-
-Configure Postfix on the Wazuh Manager to relay all outbound emails through `smtp.gmail.com:587` over IPv4 with STARTTLS and a Gmail App Password.
-
-### 17.1 Install and Configure Postfix with SASL App Password Authentication
-
-* **Location:** Wazuh Manager (`ec2-user`)
+* **Location:** Wazuh Manager (`172.31.7.137`)
 * **Execution user:** `root`
-* **Purpose:** Install Postfix and Cyrus SASL, configure Gmail STARTTLS relay, and secure `/etc/postfix/sasl_passwd` and `/etc/postfix/sasl_passwd.db`.
+* **Purpose:** Install Postfix and SASL modules, configure Gmail STARTTLS relay over IPv4, and test email delivery to `hiddenclue0@gmail.com`.
 
 ```bash
 SMTP_HOST="smtp.gmail.com"
 SMTP_PORT="587"
 SMTP_USERNAME="devops.jakir@gmail.com"
 SMTP_APP_PASSWORD="<GMAIL_APP_PASSWORD>"
+ALERT_RECIPIENT_EMAIL="hiddenclue0@gmail.com"
 
-# 1. Install required packages
+# 1. Install Postfix, Cyrus SASL, and s-nail
 dnf install -y postfix cyrus-sasl cyrus-sasl-plain s-nail
 systemctl enable --now postfix
 
-# 2. Configure Postfix parameters using postconf (automatically deduplicates main.cf entries)
+# 2. Configure Postfix parameters idempotently via postconf
 postconf -e "inet_protocols = ipv4"
 postconf -e "relayhost = [${SMTP_HOST}]:${SMTP_PORT}"
 postconf -e "smtp_use_tls = yes"
@@ -1190,7 +1339,7 @@ postconf -e "smtp_sasl_security_options = noanonymous"
 postconf -e "smtp_tls_security_level = encrypt"
 postconf -e "smtp_tls_cafile = /etc/ssl/certs/ca-bundle.crt"
 
-# 3. Create the SASL credentials file and hash database with strict 0600 permissions
+# 3. Create /etc/postfix/sasl_passwd and compile the hash database
 cat << EOF > /etc/postfix/sasl_passwd
 [${SMTP_HOST}]:${SMTP_PORT} ${SMTP_USERNAME}:${SMTP_APP_PASSWORD}
 EOF
@@ -1201,31 +1350,30 @@ postmap /etc/postfix/sasl_passwd
 chown root:root /etc/postfix/sasl_passwd.db
 chmod 600 /etc/postfix/sasl_passwd.db
 
-# 4. Validate Postfix configuration and restart
+# 4. Validate and restart Postfix
 postfix check && systemctl restart postfix
 ```
 
 * **Validation:**
-  ```bash
-  ls -l /etc/postfix/sasl_passwd /etc/postfix/sasl_passwd.db
-  postqueue -p
-  echo "Postfix STARTTLS verification test" | mail -s "Wazuh SMTP Relay Test" "hiddenclue0@gmail.com"
-  sleep 3
-  tail -n 15 /var/log/maillog
-  ```
-  Verify `/var/log/maillog` shows `relay=smtp.gmail.com[...]:587 ... status=sent (250 2.0.0 OK ...)`.
+```bash
+echo "Wazuh Postfix Gmail STARTTLS relay verification" | mail -s "Wazuh SMTP Relay Test" "hiddenclue0@gmail.com"
+sleep 4
+tail -n 15 /var/log/maillog
+```
+* **Expected output (reference only):**
+```text
+postfix/smtp[...]: to=<hiddenclue0@gmail.com>, relay=smtp.gmail.com[...]:587, dsn=2.0.0, status=sent (250 2.0.0 OK ... - gsmtp)
+```
 
 ---
 
-## 18. Wazuh Email Integration (`custom-html-email.py`)
+## 16. Duplicate Notification Prevention & HTML Email Integration
 
-Deploy `/var/ossec/integrations/custom-html-email.py` on the Wazuh Manager.
+### 16.1 Deploy `/var/ossec/integrations/custom-html-email.py`
 
-### 18.1 Deploy `/var/ossec/integrations/custom-html-email.py`
-
-* **Location:** Wazuh Manager (`ec2-user`)
+* **Location:** Wazuh Manager (`172.31.7.137`)
 * **Execution user:** `root`
-* **Purpose:** Create the Python integration script with `fcntl` locking, PID session caching, TigerVNC path attribution, incident deduplication, and the 6-section HTML email template.
+* **Purpose:** Install the custom HTML notification script with `fcntl.flock` concurrency locking, PID session caching, TigerVNC path user extraction, and incident cooldown deduplication.
 
 ```bash
 SMTP_USERNAME="devops.jakir@gmail.com"
@@ -1327,14 +1475,12 @@ def update_and_resolve_context(cache, agent_id, rule_id, groups, full_log, locat
     sessions = {k: v for k, v in sessions.items() if now - v.get("ts", 0) < 7200}
 
     vnc_display = None
-    # 1. Extract Linux username & VNC display from TigerVNC log file path: /home/<user>/.local/share/tigervnc/<host>:<display>.log
     if location and ("tigervnc" in location or ".vnc" in location):
         m_vnc = re.search(r"/home/([^/]+)/.*:(\d+)\.log", location)
         if m_vnc:
             dstuser = dstuser or m_vnc.group(1)
             vnc_display = f":{m_vnc.group(2)}"
 
-    # 2. Extract username from /srv/sftp/<user>/... or /home/<user>/... if present in file_path
     if not dstuser and file_path:
         if file_path.startswith("/srv/sftp/"):
             parts = file_path.split("/")
@@ -1345,7 +1491,6 @@ def update_and_resolve_context(cache, agent_id, rule_id, groups, full_log, locat
             if len(parts) >= 3 and parts[2]:
                 dstuser = parts[2]
 
-    # 3. Check raw syslog text for username and source IP if decoder did not populate them
     if not dstuser:
         m_u = re.search(r"(?:for local user |for invalid user |user=|\bfor )([a-zA-Z0-9_.-]+)", full_log)
         if m_u and m_u.group(1) not in ("from", "port", "id"):
@@ -1355,7 +1500,6 @@ def update_and_resolve_context(cache, agent_id, rule_id, groups, full_log, locat
         if m_ip:
             srcip = m_ip.group(1)
 
-    # 4. Correlate by OpenSSH / internal-sftp PID
     pid = extract_pid(full_log)
     skey = f"{agent_id}:{pid}" if pid else None
     last_op = None
@@ -1606,9 +1750,8 @@ def main():
 
         agent_name = agent.get("name", "vnc-server")
         agent_id = agent.get("id", "001")
-        agent_ip = agent.get("ip", "127.0.0.1")
+        agent_ip = agent.get("ip", "172.31.9.50")
 
-        # Note: Do NOT fall back to syscheck.audit.user.name on SFTP events to prevent 'ec2-user' auid misattribution
         srcip = data.get("srcip")
         srcport = data.get("srcport")
         dstuser = data.get("dstuser") or data.get("srcuser")
@@ -1623,7 +1766,6 @@ def main():
         )
         save_json(CACHE_FILE, cache)
 
-        # SFTP file open rules (100502/100503) only update the cache; Rule 100507 sends the transfer email
         if rule_id in ("100502", "100503"):
             sys.exit(0)
 
@@ -1639,7 +1781,6 @@ def main():
         if not categories.get(cat_key, False):
             sys.exit(0)
 
-        # Deduplication check per incident type
         if rule_id == "100601":
             dkey = f"bf:MEDIUM:{agent_id}:{srcip}:{dstuser}"
             cd = int(cooldowns.get("ssh_bruteforce_medium", 300))
@@ -1806,267 +1947,180 @@ chmod 750 /var/ossec/integrations/custom-html-email.py
 mkdir -p /var/ossec/tmp
 chown root:wazuh /var/ossec/tmp
 chmod 770 /var/ossec/tmp
+```
+
+### 16.2 Register the Integration in Manager `/var/ossec/etc/ossec.conf` and Restart `wazuh-manager`
+
+* **Location:** Wazuh Manager (`172.31.7.137`)
+* **Execution user:** `root`
+* **Purpose:** Disable legacy plain-text `wazuh-maild` (`<email_notification>no</email_notification>`), ensure only one `<integration>` block exists for `custom-html-email.py`, and restart `wazuh-manager`.
+
+```bash
+cp /var/ossec/etc/ossec.conf /var/ossec/etc/ossec.conf.bak
+
+sed -i 's|<email_notification>yes</email_notification>|<email_notification>no</email_notification>|g' /var/ossec/etc/ossec.conf
+sed -i '/<email_alerts>/,/<\/email_alerts>/d' /var/ossec/etc/ossec.conf
+sed -i '/<integration>/,/<\/integration>/d' /var/ossec/etc/ossec.conf
+
+sed -i '0,/<\/ossec_config>/s|<\/ossec_config>|  <integration>\n    <name>custom-html-email.py</name>\n    <group>authentication_success,sftp_session,notify_sftp_connect,notify_sftp_transfer,notify_sftp_denied,notify_ssh_bruteforce,notify_ssh_suspicious,notify_user_mgmt,notify_group_mgmt,notify_vnc,notify_fim,notify_other,</group>\n    <alert_format>json</alert_format>\n  </integration>\n\n</ossec_config>|' /var/ossec/etc/ossec.conf
 
 /var/ossec/framework/python/bin/python3 -m py_compile /var/ossec/integrations/custom-html-email.py
 /var/ossec/bin/wazuh-analysisd -t && systemctl restart wazuh-manager
 ```
 
 * **Validation:**
-  ```bash
-  ls -la /var/ossec/integrations/custom-html-email.py
-  systemctl status wazuh-manager --no-pager
-  ```
-
----
-
-## 19. Wazuh Dashboard Multi-User Management
-
-### 19.1 Understanding the 5 Account Types in a Wazuh Environment
-
-Do not confuse Linux server accounts with Wazuh web accounts:
-
-| Account Type | Where It Lives | Purpose | Example |
-| :--- | :--- | :--- | :--- |
-| **1. Linux Server Users** | `/etc/passwd` on RHEL servers | OS login via SSH, SFTP, or TigerVNC | `ec2-user`, `user1`, `user2`, `user3`, `user4` |
-| **2. Wazuh Agents** | `/var/ossec/etc/client.keys` | Server-to-Server encrypted telemetry link | `vnc-server` (Agent ID `001`) |
-| **3. Wazuh Indexer Internal Users** | OpenSearch Security Plugin | Authenticates human users logging into the Wazuh Dashboard web UI | `admin`, `jakir` |
-| **4. Wazuh Server API Users** | `wazuh-apid` RBAC database | Authenticates Dashboard-to-Manager API requests (e.g., active response, rule edits) | `wazuh-wui` (service account) + mapped RBAC roles |
-| **5. Wazuh Dashboard Users** | Backed by Wazuh Indexer Security | The web session resulting from Indexer + API RBAC mapping | Team member web logins |
-
----
-
-## 20. Role-Based Access Management (RBAC)
-
-To allow multiple team members to access the Wazuh Dashboard without sharing the default `admin` password, create dedicated internal users and map them to three privilege tiers:
-
-| Role Tier | Placeholder Username | Indexer Role | Wazuh API Role | Capabilities |
-| :--- | :--- | :--- | :--- | :--- |
-| **Tier 1: Administrator** | `admin` | `all_access` | `administrator` | Full access to rules, decoders, agent management, and user administration |
-| **Tier 2: Security Analyst** | `jakir` | `readall_and_monitor` + `kibana_user` | `readonly` + `agents_read` | Investigate alerts, Threat Hunting, FIM, dashboards, and reports; **cannot** edit rules or delete agents |
-| **Tier 3: Read-Only Viewer** | `viewuser` | `readall` + `kibana_read_only` | `readonly` | View dashboards and security events only; cannot modify saved objects or settings |
-
-### 20.1 Step-by-Step Procedure to Create Team Accounts in Wazuh Dashboard
-
-1. **Create the Internal User in OpenSearch Security:**
-   * Log in to `https://<WAZUH_MANAGER_IP>` as `admin`.
-   * Open the top-left menu ($\equiv$) -> **Indexer Management** -> **Security** -> **Internal users** -> **Create internal user**.
-   * Create `admin`, `jakir`, and `viewuser` with strong passwords (minimum 12 characters).
-2. **Map Indexer Backend Roles:**
-   * Go to **Indexer Management** -> **Security** -> **Roles**.
-   * Select `all_access` -> **Mapped users** -> **Manage mapping** -> Add `admin`.
-   * Select `kibana_user` and `readall_and_monitor` -> **Manage mapping** -> Add `jakir` and `viewuser`.
-3. **Map Wazuh Server API RBAC Permissions (Critical Step in Wazuh 4.14):**
-   * Open the top-left menu ($\equiv$) -> **Server Management** -> **Security** -> **Roles mapping** -> **Create Role mapping**.
-   * **Mapping 1 (Admins):**
-     * **Role mapping name:** `Team_Administrators`
-     * **Roles:** `administrator`
-     * **Internal users:** `admin`
-   * **Mapping 2 (Analysts & Viewers — Read-Only Server Config):**
-     * **Role mapping name:** `Team_Security_Analysts_ReadOnly`
-     * **Roles:** `readonly`
-     * **Internal users:** `jakir`, `viewuser`
-   * Click **Save role mapping**.
-4. **How to Disable or Remove an Employee Account (Offboarding):**
-   * Navigate to **Server Management** -> **Security** -> **Roles mapping** and remove the user from the mapping.
-   * Navigate to **Indexer Management** -> **Security** -> **Internal users**, select the user, and click **Delete**.
-5. **Auditing Dashboard Administrative Activity:**
-   * All Wazuh Server API calls (including rule edits and role changes) are logged in `/var/ossec/logs/api.log` on `ec2-user` with the authenticated username and source IP.
-
----
-
-## 21. Testing and Validation
-
-Execute these real-world manual tests from an authorized Linux testing machine against `<SERVER_PRIVATE_IP>` (`172.31.15.62`).
-
-*(Note on `ec2-user` Password Testing: If `ec2-user` does not have a Linux password set, set a temporary strong password with `sudo passwd ec2-user` on `vnc-server` before running Test 1, or test with `-o PreferredAuthentications=password -o PubkeyAuthentication=no`.)*
-
-### 21.1 Test Execution & Verification Commands
-
-#### Test 1: 5 Invalid SSH Passwords for `ec2-user` (Medium Brute-Force)
-* **Location:** Testing Machine
-* **Command:**
-  ```bash
-  for i in {1..5}; do
-    ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 ec2-user@<SERVER_PRIVATE_IP>
-  done
-  ```
-* **Verification on Wazuh Manager:**
-  ```bash
-  grep '"id":"100601"' /var/ossec/logs/alerts/alerts.json | grep "ec2-user" | tail -n 1
-  tail -n 15 /var/log/maillog
-  ```
-
-#### Test 2: 5 Invalid SSH Passwords for `user1` (Medium Brute-Force)
-* **Location:** Testing Machine
-* **Command:**
-  ```bash
-  for i in {1..5}; do
-    ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 user1@<SERVER_PRIVATE_IP>
-  done
-  ```
-
-#### Test 3: 5 Invalid SSH Passwords for `user3` (`sftp-denied` Account)
-* **Location:** Testing Machine
-* **Command:**
-  ```bash
-  for i in {1..5}; do
-    ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 user3@<SERVER_PRIVATE_IP>
-  done
-  ```
-
-#### Test 4: 10 Invalid SSH Passwords Within 5 Minutes (High Escalation)
-* **Location:** Testing Machine
-* **Command:** Run 5 additional failed attempts for `user1` within 5 minutes of Test 2 (total 10 failed attempts).
-* **Verification on Wazuh Manager:**
-  ```bash
-  grep '"id":"100611"' /var/ossec/logs/alerts/alerts.json | tail -n 1
-  ```
-
-#### Test 5: Successful SSH Login (`ec2-user`)
-* **Location:** Testing Machine
-* **Command:** `ssh ec2-user@<SERVER_PRIVATE_IP>` (Authenticate and `exit`).
-
-#### Test 6, 7 & 8: SFTP Login & File Upload by `user1`, File Download by `user2`
-* **Location:** Testing Machine
-* **Command:**
-  ```bash
-  echo "Semiconductor verification test" > wafer_map.gds
-  sftp user1@<SERVER_PRIVATE_IP>
-  # Inside sftp>:
-  cd files
-  put wafer_map.gds
-  exit
-
-  # Copy file into user2's directory on vnc-server or upload and download as user2:
-  sftp user2@<SERVER_PRIVATE_IP>
-  cd files
-  put wafer_map.gds
-  get wafer_map.gds wafer_map_downloaded.gds
-  exit
-  ```
-* **Verification on Wazuh Manager:**
-  ```bash
-  grep '"id":"100507"' /var/ossec/logs/alerts/alerts.json | tail -n 5
-  ```
-
-#### Test 9: Unauthorized SFTP Attempt by `user3` (`sftp-denied`)
-* **Location:** Testing Machine
-* **Command:**
-  ```bash
-  sftp user3@<SERVER_PRIVATE_IP>
-  # Enter user3's valid password -> Immediately rejected by /usr/sbin/nologin
-  ```
-* **Verification on Wazuh Manager:**
-  ```bash
-  grep '"id":"100505"' /var/ossec/logs/alerts/alerts.json | tail -n 1
-  ```
-
-#### Test 10 & 11: TigerVNC Authentication Failure & Success as `user1` (`:1` / Port `5901`)
-* **Location:** Testing Machine (using `vncviewer <SERVER_PRIVATE_IP>:5901`)
-* **Action:** First enter an invalid VNC password (triggers Rule `100510`), then connect with `user1`'s valid VNC password (triggers Rule `100509`).
-* **Verification on Wazuh Manager:**
-  ```bash
-  grep -E '"id":"100509"|"id":"100510"' /var/ossec/logs/alerts/alerts.json | tail -n 2
-  ```
-
-#### Test 12 & 13: Create a New Linux User (`staff01`) and Perform SSH/SFTP Without Editing Wazuh
-* **Location:** Wazuh Agent (`vnc-server`)
-* **Command:**
-  ```bash
-  useradd -m -s /bin/bash staff01
-  passwd staff01
-  /usr/local/sbin/setup-sftp-chroot-user.sh staff01
-  ```
-* **Location:** Testing Machine
-* **Command:** Connect via `sftp staff01@<SERVER_PRIVATE_IP>`, `cd files`, and `put wafer_map.gds`.
-* **Verification on Wazuh Manager:** Confirm Rule `100507` fires with `dstuser: staff01` and sends 1 HTML email identifying `staff01`.
-
----
-
-## 22. Troubleshooting Reference
-
-| Symptom | Diagnostic Command | Root Cause & Resolution |
-| :--- | :--- | :--- |
-| **1. Wazuh agent disconnected** | `/var/ossec/bin/agent_control -i 001` | Verify TCP ports `1514` and `1515` are open in AWS Security Group and `firewalld` on `<WAZUH_MANAGER_IP>`. |
-| **2. SFTP upload/download events missing for chrooted users** | `grep "/srv/sftp" /proc/mounts` (on Agent) | Chrooted `internal-sftp` requires `/srv/sftp/<user>/dev/log` bind-mounted to `/run/systemd/journal/dev-log`. Run `/usr/local/sbin/setup-sftp-chroot-user.sh <user>`. |
-| **3. SFTP user reported as `ec2-user`** | Check `/var/ossec/integrations/custom-html-email.py` | Ensure `custom-html-email.py` does not fall back to `syscheck.audit.user.name` (`auid`) on SFTP events and uses the PID session cache (`Step 18.1`). |
-| **4. Brute-force rule not triggering on `ec2-user` or `user3`** | `tail -n 20 /var/log/secure` (on Agent) | Ensure `PasswordAuthentication yes` is active for the user and use `ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no` when testing. |
-| **5. Medium brute-force triggers, High does not** | Check rule order in `ssh_and_network_rules.xml` | Rule `100611` (`frequency="10"`) must appear **above** Rule `100601` (`frequency="5"`), and `100601` must include `authentication_failed` in its `<group>` list. |
-| **6. Duplicate emails for the same incident** | `grep "<integration>" /var/ossec/etc/ossec.conf` | Verify `<email_notification>no</email_notification>` is set, only one `<integration>` block exists, and `journald` is removed from Agent `ossec.conf` when `/var/log/secure` is collected. |
-| **7. Postfix authentication failure (`535 5.7.8`)** | `tail -n 30 /var/log/maillog` | Regenerate a 16-character Google App Password, update `/etc/postfix/sasl_passwd`, run `postmap /etc/postfix/sasl_passwd`, and `systemctl restart postfix`. |
-
----
-
-## 23. Backup and Rollback Procedures
-
-To roll back to the pre-change state at any time, restore from the timestamped backup directory created in **Section 4**:
-
 ```bash
-# On Wazuh Manager:
-cp -a /root/wazuh_manager_backup_<TIMESTAMP>/ossec.conf /var/ossec/etc/ossec.conf
-cp -a /root/wazuh_manager_backup_<TIMESTAMP>/decoders/* /var/ossec/etc/decoders/
-cp -a /root/wazuh_manager_backup_<TIMESTAMP>/rules/* /var/ossec/etc/rules/
-cp -a /root/wazuh_manager_backup_<TIMESTAMP>/integrations/* /var/ossec/integrations/
-/var/ossec/bin/wazuh-analysisd -t && systemctl restart wazuh-manager
-
-# On Wazuh Agent:
-cp -a /root/wazuh_agent_backup_<TIMESTAMP>/sshd_config /etc/ssh/sshd_config
-cp -a /root/wazuh_agent_backup_<TIMESTAMP>/sshd_config.d/* /etc/ssh/sshd_config.d/
-sshd -t && systemctl reload sshd
-cp -a /root/wazuh_agent_backup_<TIMESTAMP>/ossec.conf /var/ossec/etc/ossec.conf
-systemctl restart wazuh-agent
+systemctl status wazuh-manager --no-pager
+ps aux | grep wazuh-integratord
 ```
 
 ---
 
-## 24. Employee Onboarding and Offboarding Procedures
+## 17. Dashboard Multi-User and Role Management
 
-### 24.1 Onboarding a New Engineering User (Linux + SFTP + TigerVNC)
+### 17.1 Account Types and Role Architecture
 
-* **Location:** Wazuh Agent (`vnc-server`)
-* **Execution user:** `root`
+| Username Variable | Role Tier | OpenSearch Indexer Role | Wazuh Server API Role | Access Scope |
+| :--- | :--- | :--- | :--- | :--- |
+| `WAZUH_ADMIN_USERNAME="admin"` | **Administrator** | `all_access` | `administrator` | Full control over rules, decoders, agents, and RBAC |
+| `WAZUH_ANALYST_USERNAME="jakir"` | **Security Analyst** | `readall_and_monitor`, `kibana_user` | `readonly`, `agents_read` | Investigate alerts, Threat Hunting, FIM, and reports; cannot modify rules |
+| `WAZUH_VIEWER_USERNAME="viewuser"` | **Read-Only Viewer** | `readall`, `kibana_read_only` | `readonly` | View dashboards and security events only |
+
+### 17.2 Step-by-Step Procedure to Create `jakir` (Analyst) and `viewuser` (Viewer)
+
+1. Log in to `https://172.31.7.137` as `admin`.
+2. Open the main menu ($\equiv$) -> **Indexer Management** -> **Security** -> **Internal users** -> **Create internal user**:
+   * Create user `jakir` with a strong password.
+   * Create user `viewuser` with a strong password.
+3. Map OpenSearch Indexer Roles (**Indexer Management** -> **Security** -> **Roles**):
+   * Select `kibana_user` and `readall_and_monitor` -> **Mapped users** -> **Manage mapping** -> Add `jakir`.
+   * Select `kibana_read_only` and `readall` -> **Mapped users** -> **Manage mapping** -> Add `viewuser`.
+4. Map Wazuh Server API Roles (**Server Management** -> **Security** -> **Roles mapping** -> **Create Role mapping**):
+   * **Role mapping name:** `Security_Team_ReadOnly`
+   * **Roles:** `readonly`
+   * **Internal users:** `jakir`, `viewuser`
+   * Click **Save role mapping**.
+
+---
+
+## 18. End-to-End Testing
+
+Run these tests from an authorized testing machine (such as `172.31.7.137`) targeting `vnc-server` (`172.31.9.50`).
+
+### 18.1 SSH Brute-Force (5 Attempts -> Medium Email; 10 Attempts -> High Email)
+
+* **Location:** Testing Machine (`172.31.7.137`)
+* **Purpose:** Trigger 5 failed SSH password attempts (`Rule 100601` — Medium) followed by 5 more failed attempts (`Rule 100611` — High) for `user1` and `user3`.
 
 ```bash
-NEW_USER="<LINUX_USERNAME>"
-VNC_DISP="<VNC_DISPLAY_NUMBER>"   # e.g., :5
+# Test 5 failed password attempts for user1 (Triggers 1 [MEDIUM] email on attempt #5):
+for i in {1..5}; do
+  ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 user1@172.31.9.50
+done
+
+# Continue with attempts #6 through #10 within 5 minutes (Triggers 1 [HIGH] escalation email on attempt #10):
+for i in {6..10}; do
+  ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 user1@172.31.9.50
+done
+```
+
+* **Verification on Wazuh Manager (`172.31.7.137`):**
+```bash
+grep -E '"id":"100601"|"id":"100611"' /var/ossec/logs/alerts/alerts.json | tail -n 5
+tail -n 20 /var/log/maillog
+```
+
+### 18.2 SFTP Upload (`user1`), Download (`user2`), and Restricted Denial (`user3`)
+
+* **Location:** Testing Machine (`172.31.7.137`)
+* **Purpose:** Validate SFTP file upload (`Rule 100507`), SFTP file download (`Rule 100507`), and restricted user SFTP block (`Rule 100505`).
+
+```bash
+# 1. Upload a file as user1 (Triggers 1 [MEDIUM] SFTP File Transfer Detected email for user1)
+echo "Semiconductor wafer layout test" > chip_layout_v1.gds
+sftp user1@172.31.9.50
+# Inside sftp>:
+cd files
+put chip_layout_v1.gds
+exit
+
+# 2. Upload and download a file as user2 (Triggers [MEDIUM] SFTP File Transfer Detected email for user2)
+sftp user2@172.31.9.50
+# Inside sftp>:
+cd files
+put chip_layout_v1.gds
+get chip_layout_v1.gds downloaded_chip.gds
+exit
+
+# 3. Attempt SFTP connection as restricted user3 in sftp-denied (Triggers 1 [HIGH] SFTP Access Denied email for user3)
+sftp user3@172.31.9.50
+```
+
+* **Verification on Wazuh Manager (`172.31.7.137`):**
+```bash
+grep -E '"id":"100507"|"id":"100505"' /var/ossec/logs/alerts/alerts.json | tail -n 5
+tail -n 20 /var/log/maillog
+```
+
+---
+
+## 19. Troubleshooting
+
+| Problem | Diagnostic Command | Root Cause & Fix |
+| :--- | :--- | :--- |
+| **1. Wazuh agent disconnected** | `/var/ossec/bin/agent_control -i 001` (on Manager) | Confirm TCP ports `1514` and `1515` are open in the AWS EC2 Security Group and `firewalld` on `172.31.7.137`. |
+| **2. SFTP upload/download events missing for `user1`/`user2`** | `grep "/srv/sftp" /proc/mounts` (on `172.31.9.50`) | Chrooted `internal-sftp` requires `/srv/sftp/<user>/dev/log` bind-mounted. Run `/usr/local/sbin/setup-sftp-chroot-user.sh user1`. |
+| **3. SFTP actions misattributed to `ec2-user`** | Inspect `/var/ossec/integrations/custom-html-email.py` | Ensure `custom-html-email.py` does not use `syscheck.audit.user.name` (`auid`) on SFTP events and uses the PID session cache (`Section 16.1`). |
+| **4. Brute-force rule not triggering** | `tail -n 20 /var/log/secure` (on `172.31.9.50`) | Use `ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no` so SSH prompts for a password rather than disconnecting at `[preauth]`. |
+| **5. Duplicate emails sent** | `grep "<integration>" /var/ossec/etc/ossec.conf` | Ensure `<email_notification>no</email_notification>` is set, only one `<integration>` block exists, and `journald` is removed from Agent `ossec.conf`. |
+| **6. Postfix auth failure (`535 5.7.8`)** | `tail -n 30 /var/log/maillog` (on `172.31.7.137`) | Update `/etc/postfix/sasl_passwd` with a valid 16-character Google App Password, run `postmap /etc/postfix/sasl_passwd`, and restart `postfix`. |
+
+---
+
+## 20. Backup, Recovery, and Employee Maintenance
+
+### 20.1 Onboarding a New Linux / SFTP / TigerVNC Employee Account
+
+* **Location:** Wazuh Agent (`vnc-server` — `172.31.9.50`)
+* **Execution user:** `root`
+* **Purpose:** Create a new employee account (`<LINUX_USERNAME>`) with automatic SSH, SFTP, and TigerVNC monitoring.
+
+```bash
+LINUX_USERNAME="<LINUX_USERNAME>"
+VNC_DISPLAY="<VNC_DISPLAY_NUMBER>"   # e.g., :5
 
 # 1. Create Linux user and set password
-useradd -m -s /bin/bash "$NEW_USER"
-chmod 700 "/home/${NEW_USER}"
-passwd "$NEW_USER"
+useradd -m -s /bin/bash "$LINUX_USERNAME"
+chmod 700 "/home/${LINUX_USERNAME}"
+passwd "$LINUX_USERNAME"
 
 # 2A. If user is allowed SFTP access:
-/usr/local/sbin/setup-sftp-chroot-user.sh "$NEW_USER"
+/usr/local/sbin/setup-sftp-chroot-user.sh "$LINUX_USERNAME"
 
 # 2B. OR if user is DENIED SFTP access (VNC-only):
-# usermod -aG sftp-denied "$NEW_USER"
+# usermod -aG sftp-denied "$LINUX_USERNAME"
 
-# 3. Configure TigerVNC display (if VNC access is required):
-echo "${VNC_DISP}=${NEW_USER}" >> /etc/tigervnc/vncserver.users
-su - "$NEW_USER" -c "vncpasswd"
+# 3. Configure TigerVNC display:
+echo "${VNC_DISPLAY}=${LINUX_USERNAME}" >> /etc/tigervnc/vncserver.users
+su - "$LINUX_USERNAME" -c "vncpasswd"
 systemctl daemon-reload
-systemctl enable --now "vncserver@${VNC_DISP}.service"
+systemctl enable --now "vncserver@${VNC_DISPLAY}.service"
 systemctl restart wazuh-agent
 ```
 
-### 24.2 Offboarding an Employee
-
-* **Location:** Wazuh Agent (`vnc-server`)
-* **Execution user:** `root`
+### 20.2 Full Configuration Backup & Rollback Commands
 
 ```bash
-OLD_USER="<LINUX_USERNAME>"
-VNC_DISP="<VNC_DISPLAY_NUMBER>"   # e.g., :5
+# Back up Wazuh Manager (172.31.7.137):
+tar -czf "/root/wazuh_manager_full_backup_$(date +%Y%m%d).tar.gz" \
+  /var/ossec/etc/ossec.conf \
+  /var/ossec/etc/decoders/ \
+  /var/ossec/etc/rules/ \
+  /var/ossec/etc/email_notification_policy.json \
+  /var/ossec/integrations/custom-html-email.py \
+  /etc/postfix/main.cf /etc/postfix/sasl_passwd
 
-# 1. Stop VNC session and lock Linux account
-systemctl disable --now "vncserver@${VNC_DISP}.service" 2>/dev/null || true
-sed -i "/=${OLD_USER}$/d" /etc/tigervnc/vncserver.users
-usermod -L "$OLD_USER"
-pkill -KILL -u "$OLD_USER" || true
-
-# 2. Unmount chroot /dev/log socket if present
-if grep -q "/srv/sftp/${OLD_USER}/dev/log" /proc/mounts; then
-    umount "/srv/sftp/${OLD_USER}/dev/log"
-fi
-sed -i "\|/srv/sftp/${OLD_USER}/dev/log|d" /etc/fstab
+# Roll back Wazuh Manager if needed:
+tar -xzf /root/wazuh_manager_full_backup_<DATE>.tar.gz -C /
+/var/ossec/bin/wazuh-analysisd -t && systemctl restart wazuh-manager
 ```
