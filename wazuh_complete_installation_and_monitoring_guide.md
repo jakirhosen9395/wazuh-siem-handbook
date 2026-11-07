@@ -13,7 +13,7 @@ Replace the following placeholders with your actual environment values when exec
 | Placeholder | Description | Reference Value from Deployment |
 | :--- | :--- | :--- |
 | `<WAZUH_SERVER_IP>` | Private IPv4 of the Wazuh All-in-One Server (`wazuh-server`) | `11.11.2.165` |
-| `<AGENT_SERVER_IP>` | Private IPv4 of the Monitored Linux Agent (`vnc-server`) | `11.11.3.185` |
+| `<AGENT_SERVER_IP>` | Private IPv4 of the Monitored Linux Agent (`vnc-server`) | `11.11.3.213` |
 | `<TEST_CLIENT_IP_1>` | First IPv4 used for SSH/SFTP testing | `11.11.2.50` |
 | `<TEST_CLIENT_IP_2>` | Second IPv4 used for multi-IP & brute-force testing | `11.11.2.165` |
 | `<SENDER_EMAIL_ADDRESS>` | Gmail / SMTP account used by Postfix to send alerts | `your-sender@gmail.com` |
@@ -23,7 +23,7 @@ Replace the following placeholders with your actual environment values when exec
 
 ```text
 +-----------------------------------------------------------------------------------+
-| MONITORED LINUX AGENT: vnc-server (11.11.3.185) - RHEL 9.8 (x86_64)         |
+| MONITORED LINUX AGENT: vnc-server (11.11.3.213) - RHEL 9.8 (x86_64)         |
 |                                                                                   |
 |  +-----------------------+   +-----------------------+   +---------------------+  |
 |  | /var/log/secure       |   | /var/log/audit/       |   | Command & FIM       |  |
@@ -74,8 +74,8 @@ Replace the following placeholders with your actual environment values when exec
 | Port | Protocol | Source | Destination | Component / Service | Purpose |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **443** | TCP | Admin Workstations | `11.11.2.165` | `wazuh-dashboard` | Wazuh Web UI (HTTPS) |
-| **1514** | TCP | `11.11.3.185` | `11.11.2.165` | `wazuh-remoted` | Encrypted agent event forwarding |
-| **1515** | TCP | `11.11.3.185` | `11.11.2.165` | `wazuh-authd` | Agent enrollment and key exchange |
+| **1514** | TCP | `11.11.3.213` | `11.11.2.165` | `wazuh-remoted` | Encrypted agent event forwarding |
+| **1515** | TCP | `11.11.3.213` | `11.11.2.165` | `wazuh-authd` | Agent enrollment and key exchange |
 | **55000** | TCP | `127.0.0.1` / Admins | `11.11.2.165` | `wazuh-apid` | Wazuh Manager RESTful API |
 | **9200** | TCP | `127.0.0.1` | `127.0.0.1` | `wazuh-indexer` | OpenSearch REST API (Localhost only) |
 | **587** | TCP | `11.11.2.165` | `smtp.gmail.com` | `postfix` | Outbound STARTTLS email alert delivery |
@@ -358,7 +358,7 @@ sudo curl -k -u admin:<WAZUH_ADMIN_PASSWORD> https://127.0.0.1:9200/_cluster/hea
 ## 4. Phase 3: Complete Wazuh Agent Installation & Registration (`vnc-server`)
 
 ### Step 7: Prepare the Agent OS and Verify Network Connectivity to the Wazuh Manager
-* **Server:** Wazuh Agent (`vnc-server` — `11.11.3.185`, RHEL 9.8)
+* **Server:** Wazuh Agent (`vnc-server` — `11.11.3.213`, RHEL 9.8)
 * **Files Modified:** System packages
 
 #### Commands:
@@ -388,7 +388,7 @@ Both port checks print `Open`, and `auditd` returns `active`.
 ---
 
 ### Step 8: Install, Enroll, and Start the Wazuh v4.14.9 Agent
-* **Server:** Wazuh Agent (`vnc-server` — `11.11.3.185`, RHEL 9.8)
+* **Server:** Wazuh Agent (`vnc-server` — `11.11.3.213`, RHEL 9.8)
 * **Files Created/Modified:** `/var/ossec/etc/ossec.conf`, `/var/ossec/etc/client.keys`, `/var/ossec/etc/local_internal_options.conf`
 
 #### Commands:
@@ -431,7 +431,7 @@ Agent `ossec.log` shows `Valid key received` and `Connected to the server ([11.1
 ## 5. Phase 4: Complete SSH, SFTP, Command, FIM, and Network Monitoring Setup
 
 ### Step 9: Configure OpenSSH (`sshd`) for Verbose Authentication Logging & SFTP Access Control
-* **Server:** Wazuh Agent (`vnc-server` — `11.11.3.185`, RHEL 9.8)
+* **Server:** Wazuh Agent (`vnc-server` — `11.11.3.213`, RHEL 9.8)
 * **Files Modified:** `/etc/ssh/sshd_config`, `/etc/ssh/sshd_config.d/50-sftp-monitoring.conf`
 
 #### Configuration (`/etc/ssh/sshd_config.d/50-sftp-monitoring.conf`):
@@ -581,7 +581,7 @@ sudo auditctl -l
 ---
 
 ### Step 11: Configure Complete Wazuh Agent `ossec.conf` (SSH, SFTP, Auditd, Whodata FIM & Port Monitoring)
-* **Server:** Wazuh Agent (`vnc-server` — `11.11.3.185`, RHEL 9.8)
+* **Server:** Wazuh Agent (`vnc-server` — `11.11.3.213`, RHEL 9.8)
 * **File Modified:** `/var/ossec/etc/ossec.conf`
 
 #### Complete Configuration (`/var/ossec/etc/ossec.conf` on Agent):
