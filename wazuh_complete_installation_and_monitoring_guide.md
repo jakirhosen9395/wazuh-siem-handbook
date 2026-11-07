@@ -2,88 +2,108 @@
 
 This master runbook covers both the **complete Wazuh v4.14.9 installation from scratch** on Red Hat Enterprise Linux (RHEL) 9.8 and the **audited production fix and upgrade** for universal Linux/VNC user monitoring, granular SFTP transfer tracking, multi-tier SSH brute-force detection (5-attempt Medium and 10-attempt High), and a centralized, category-based HTML email notification system.
 
----
-
 ## 1. Root-Cause Audit of Existing Issues & Architectural Fixes
 
 An audit of the existing configuration (`/var/ossec/etc/ossec.conf`, `/var/ossec/etc/decoders/sftp_decoders.xml`, `/var/ossec/etc/rules/`, `/etc/ssh/sshd_config`, `/etc/ssh/sshd_config.d/50-sftp-monitoring.conf`, and `/var/ossec/integrations/custom-html-email.py`) identified five specific root causes behind the issues you experienced:
 
 ### 1.1 Why `ec2-user` Generated SFTP Notifications While Newly Created Linux/VNC Users Did Not
+
 1. **OpenSSH `Include` Ordering & `Match Group` Scoping in `/etc/ssh/sshd_config`:**
+
    * On RHEL 9, `/etc/ssh/sshd_config` places `Include /etc/ssh/sshd_config.d/*.conf` at the **top** of the file and defines `Subsystem sftp /usr/libexec/openssh/sftp-server` at the bottom. Additionally, any directive placed after a `Match Group` block inside a drop-in file only applies to that group.
+
    * When you created a new Linux user (`sudo useradd newuser1`) without adding them to `sftp-allowed`, or if `/etc/ssh/sshd_config` still had an active `Subsystem sftp` line, OpenSSH fell back to the default `/usr/libexec/openssh/sftp-server` binary **without** `-f AUTHPRIV -l INFO`, producing **zero** SFTP file transfer logs in `/var/log/secure`.
+
    * **Fix:** Set `Subsystem sftp internal-sftp -f AUTHPRIV -l INFO` globally in `/etc/ssh/sshd_config.d/50-sftp-monitoring.conf` *above* all `Match` blocks and comment out any other `Subsystem sftp` lines in `/etc/ssh/sshd_config` and `/etc/ssh/sshd_config.d/`. Every newly created Linux user (`useradd newuser1`) is now automatically logged by `internal-sftp -l INFO` without needing manual group assignment just to get logs.
+
 2. **OpenSSH `internal-sftp` Multi-Line PID Context Split:**
+
    * OpenSSH logs SFTP sessions across separate syslog lines sharing the same `sshd[PID]`:
+
      * Session start: `sshd[24110]: session opened for local user newuser1 from [11.11.2.50]` (contains `dstuser` and `srcip`, **no** filename).
+
      * File open (upload/download attempt): `sshd[24110]: open "/home/newuser1/chip.gds" flags WRITE,CREATE,TRUNCATE mode 0664` (contains `file` and `flags`, **no** `dstuser` or `srcip` field on the line).
+
      * File close (transfer completed): `sshd[24110]: close "/home/newuser1/chip.gds" bytes read 0 written 40960` (contains `file` and bytes transferred, **no** `dstuser` or `srcip` field on the line).
+
      * Operation denied: `sshd[24110]: sent status Permission denied` (contains **no** username, IP, or filename on the raw line).
+
    * Previously, the decoders only matched `open "..."` and did not extract the username from `/home/<username>/...` or correlate the `sshd[PID]` session cache.
+
    * **Fix:** Updated `/var/ossec/etc/decoders/sftp_decoders.xml` and `/var/ossec/integrations/custom-html-email.py` to cache `(agent_id, pid) -> {username, srcip, last_file}` whenever an SSH/SFTP session opens (`Rule 5715` / `100501`) and also extract `/home/<username>/` paths directly. Every SFTP upload attempt, download, completion (`close`), and `Permission denied` failure now resolves the exact username, source IP, and file path for **all** users automatically.
+
 3. **Blocked SFTP Users (`sftp-denied` Group) Log Format Mismatch:**
+
    * When a user in `sftp-denied` attempts an SFTP connection, `sshd` logs `Accepted password for <user> from <ip>...` followed by `Starting session: forced-command (config) '/usr/bin/false' for <user> from <ip> port <port> id 0`.
+
    * Previously, `sshd` did not decode `dstuser` and `srcip` on the `forced-command` line. We added a dedicated PCRE2 child decoder (`sshd-sftp-blocked`) so `Rule 100505` captures both the username and source IP.
+
 4. **VNC Authentication Uses PAM / TigerVNC (`Xvnc`), Not `sshd`:**
+
    * Connecting to TigerVNC (`:1`, `:2`, etc.) authenticates via `/etc/pam.d/tigervnc` and logs to `/var/log/secure` (`pam_unix(tigervnc:session)`) and `/home/*/.vnc/*.log`.
+
    * **Fix:** Added `/home/*/.vnc/*.log` collection on the agent and created dedicated VNC authentication/session rules (`100509` and `100510`).
 
 ### 1.2 Why Too Many Emails Were Sent & How 5-Attempt vs. 10-Attempt Brute-Force Works
-1. **Excessive Emails:** Previously, `email_notify_alert` was attached to general SSH rules, port changes, and SFTP session opens (`100501`), causing emails even when a user merely connected via SFTP without transferring a file.
-2. **5-Attempt (`[MEDIUM]`) vs. 10-Attempt (`[HIGH]`) Correlation:**
-   * In Wazuh's `analysisd` engine, a `frequency="5"` rule (`100601`) will fire on attempt #5, and—if not suppressed—will fire again on attempts #6, #7, #8, and #9 because there are still $\ge 5$ failures within the 5-minute window. Furthermore, if Rule `100601` does not retain the `authentication_failed` group or if it is evaluated before the 10-attempt rule, it can prevent the 10-attempt rule from counting event #5.
-   * **Fix:**
-     * Both the 5-attempt (`100601`, `100602`) and 10-attempt (`100611`, `100612`) rules include `authentication_failed` in their `<group>` tags so every failed attempt continues incrementing the correlation counter.
-     * The **10-attempt High-Severity rules (`100611`, `100612`, Level 12)** are placed **above** the **5-attempt Medium-Severity rules (`100601`, `100602`, Level 8)** in `/var/ossec/etc/rules/ssh_and_network_rules.xml`, so on attempt #10 Wazuh matches the High-Severity rule first.
-     * The Python integration script maintains a 5-minute deduplication tracker per `(agent_id, rule_id, srcip, dstuser)` so that attempt #5 sends **one** `[MEDIUM] SSH Brute-Force Activity Detected` email, attempts #6–#9 do **not** send duplicate Medium emails, and attempt #10 sends **one** `[HIGH] SSH Brute-Force Attack Detected` email.
 
----
+1. **Excessive Emails:** Previously, `email_notify_alert` was attached to general SSH rules, port changes, and SFTP session opens (`100501`), causing emails even when a user merely connected via SFTP without transferring a file.
+
+2. **5-Attempt (`[MEDIUM]`) vs. 10-Attempt (`[HIGH]`) Correlation:**
+
+   * In Wazuh's `analysisd` engine, a `frequency="5"` rule (`100601`) will fire on attempt #5, and—if not suppressed—will fire again on attempts #6, #7, #8, and #9 because there are still $\ge 5$ failures within the 5-minute window. Furthermore, if Rule `100601` does not retain the `authentication_failed` group or if it is evaluated before the 10-attempt rule, it can prevent the 10-attempt rule from counting event #5.
+
+   * **Fix:**
+
+     * Both the 5-attempt (`100601`, `100602`) and 10-attempt (`100611`, `100612`) rules include `authentication_failed` in their `<group>` tags so every failed attempt continues incrementing the correlation counter.
+
+     * The **10-attempt High-Severity rules (`100611`, `100612`, Level 12)** are placed **above** the **5-attempt Medium-Severity rules (`100601`, `100602`, Level 8)** in `/var/ossec/etc/rules/ssh_and_network_rules.xml`, so on attempt #10 Wazuh matches the High-Severity rule first.
+
+     * The Python integration script maintains a 5-minute deduplication tracker per `(agent_id, rule_id, srcip, dstuser)` so that attempt #5 sends **one** `[MEDIUM] SSH Brute-Force Activity Detected` email, attempts #6–#9 do **not** send duplicate Medium emails, and attempt #10 sends **one** `[HIGH] SSH Brute-Force Attack Detected` email.
 
 ## 2. Summary of Files Modified, Backup Locations & Email Notification Policy
 
 ### 2.1 Files Modified & Backup Locations
 
-| Server | File Path | Action | Backup Location |
-| :--- | :--- | :--- | :--- |
-| **Wazuh Agent** (`vnc-server`) | `/etc/ssh/sshd_config` | Modified (Commented out legacy `Subsystem sftp`) | `/etc/ssh/sshd_config.bak` |
-| **Wazuh Agent** (`vnc-server`) | `/etc/ssh/sshd_config.d/50-sftp-monitoring.conf` | Updated global `internal-sftp -l INFO` & `Match` blocks | `/etc/ssh/sshd_config.d/50-sftp-monitoring.conf.bak` |
-| **Wazuh Agent** (`vnc-server`) | `/etc/audit/rules.d/wazuh-full-monitoring.rules` | Updated kernel `auditd` rules for all users (`auid>=1000`) | `/etc/audit/rules.d/wazuh-full-monitoring.rules.bak` |
-| **Wazuh Agent** (`vnc-server`) | `/var/ossec/etc/ossec.conf` | Added `/home/*/.vnc/*.log` & verified `/var/log/secure` | `/var/ossec/etc/ossec.conf.bak` |
-| **Wazuh Manager** (`wazuh-server`) | `/var/ossec/etc/ossec.conf` | Configured centralized `<integration>` hook | `/var/ossec/etc/ossec.conf.bak` |
-| **Wazuh Manager** (`wazuh-server`) | `/var/ossec/etc/decoders/sftp_decoders.xml` | Added PCRE2 decoders for `open`, `close`, `denied`, `vnc` | `/var/ossec/etc/decoders/sftp_decoders.xml.bak` |
-| **Wazuh Manager** (`wazuh-server`) | `/var/ossec/etc/rules/sftp_and_vnc_rules.xml` | Updated SFTP attempt, completion, denied & VNC rules | `/var/ossec/etc/rules/sftp_and_vnc_rules.xml.bak` |
-| **Wazuh Manager** (`wazuh-server`) | `/var/ossec/etc/rules/ssh_and_network_rules.xml` | Added 5-attempt (Medium) & 10-attempt (High) SSH rules | `/var/ossec/etc/rules/ssh_and_network_rules.xml.bak` |
-| **Wazuh Manager** (`wazuh-server`) | `/var/ossec/etc/email_notification_policy.json` | Created centralized category email policy toggle file | `/var/ossec/etc/email_notification_policy.json.bak` |
-| **Wazuh Manager** (`wazuh-server`) | `/var/ossec/integrations/custom-html-email.py` | Upgraded to 6-section HTML template + PID session cache | `/var/ossec/integrations/custom-html-email.py.bak` |
+| Server | File Path | Action | Backup Location | 
+| ----- | ----- | ----- | ----- | 
+| **Wazuh Agent** (`vnc-server`) | `/etc/ssh/sshd_config` | Modified (Commented out legacy `Subsystem sftp`) | `/etc/ssh/sshd_config.bak` | 
+| **Wazuh Agent** (`vnc-server`) | `/etc/ssh/sshd_config.d/50-sftp-monitoring.conf` | Updated global `internal-sftp -l INFO` & `Match` blocks | `/etc/ssh/sshd_config.d/50-sftp-monitoring.conf.bak` | 
+| **Wazuh Agent** (`vnc-server`) | `/etc/audit/rules.d/wazuh-full-monitoring.rules` | Updated kernel `auditd` rules for all users (`auid>=1000`) | `/etc/audit/rules.d/wazuh-full-monitoring.rules.bak` | 
+| **Wazuh Agent** (`vnc-server`) | `/var/ossec/etc/ossec.conf` | Added `/home/*/.vnc/*.log` & verified `/var/log/secure` | `/var/ossec/etc/ossec.conf.bak` | 
+| **Wazuh Manager** (`wazuh-server`) | `/var/ossec/etc/ossec.conf` | Configured centralized `<integration>` hook | `/var/ossec/etc/ossec.conf.bak` | 
+| **Wazuh Manager** (`wazuh-server`) | `/var/ossec/etc/decoders/sftp_decoders.xml` | Added PCRE2 decoders for `open`, `close`, `denied`, `vnc` | `/var/ossec/etc/decoders/sftp_decoders.xml.bak` | 
+| **Wazuh Manager** (`wazuh-server`) | `/var/ossec/etc/rules/sftp_and_vnc_rules.xml` | Updated SFTP attempt, completion, denied & VNC rules | `/var/ossec/etc/rules/sftp_and_vnc_rules.xml.bak` | 
+| **Wazuh Manager** (`wazuh-server`) | `/var/ossec/etc/rules/ssh_and_network_rules.xml` | Added 5-attempt (Medium) & 10-attempt (High) SSH rules | `/var/ossec/etc/rules/ssh_and_network_rules.xml.bak` | 
+| **Wazuh Manager** (`wazuh-server`) | `/var/ossec/etc/email_notification_policy.json` | Created centralized category email policy toggle file | `/var/ossec/etc/email_notification_policy.json.bak` | 
+| **Wazuh Manager** (`wazuh-server`) | `/var/ossec/integrations/custom-html-email.py` | Upgraded to 6-section HTML template + PID session cache | `/var/ossec/integrations/custom-html-email.py.bak` | 
 
 ### 2.2 Centralized Email Notification Policy Matrix
 
 All events continue to be collected, decoded, and displayed in the **Wazuh Dashboard** and `/var/ossec/logs/alerts/alerts.json`. Email delivery is controlled centrally by `/var/ossec/etc/email_notification_policy.json`:
 
-| Policy Category Key | Event Category Description | Associated Rule IDs / Groups | Default Email Status |
-| :--- | :--- | :--- | :--- |
-| `sftp_successful_transfers` | SFTP file upload/download attempt, transfer completed, delete/rename | `100502`, `100503`, `100504`, `100507` (`notify_sftp_transfer`) | **Enabled (`true`)** |
-| `sftp_failed_denied_operations` | SFTP access denied (`sftp-denied` group) or file permission/transfer failure | `100505`, `100508` (`notify_sftp_denied`) | **Enabled (`true`)** |
-| `ssh_bruteforce_detection` | SSH brute-force: 5 failures in 5m (**Medium**) & 10 failures in 5m (**High**) | `100601`, `100602` (Medium), `100611`, `100612` (High) (`notify_ssh_bruteforce`) | **Enabled (`true`)** |
-| `sftp_connection_attempts` | SFTP session opened / closed (without file transfer) | `100501`, `100511` (`notify_sftp_connect`) | **Disabled (`false`)** *(Configurable)* |
-| `ssh_authentication_events` | Individual SSH successful login (`5715`) or single failed password (`5716`) | `5715`, `5716`, `5710` (`notify_ssh_auth`) | **Disabled (`false`)** *(Configurable)* |
-| `ssh_suspicious_login` | Multi-IP login (`100603`), username spraying (`100604`), login after brute-force (`100605`), root login (`100606`), external IP (`100608`), off-hours (`100609`) | `100603`–`100610` (`notify_ssh_suspicious`) | **Disabled (`false`)** *(Configurable)* |
-| `linux_user_creation_deletion` | New Linux user created (`useradd`), modified (`usermod`), or deleted (`userdel`) | `5902`, `5903`, `5904`, `100630` (`notify_user_mgmt`) | **Disabled (`false`)** *(Configurable)* |
-| `linux_group_changes` | Linux group created or membership modified (`gpasswd`, `usermod -aG`, `/etc/group`) | `5901`, `100631` (`notify_group_mgmt`) | **Disabled (`false`)** *(Configurable)* |
-| `vnc_session_events` | TigerVNC authentication success, failure, or config change | `100506`, `100509`, `100510` (`notify_vnc`) | **Disabled (`false`)** *(Configurable)* |
-| `file_integrity_monitoring` | Real-time Whodata FIM file changes (`550`, `553`, `554`) | `syscheck` (`notify_fim`) | **Disabled (`false`)** *(Configurable)* |
-| `other_security_alerts` | Port changes (`100620`), firewall drops (`100623`), and other Wazuh alerts | `notify_other` | **Disabled (`false`)** *(Configurable)* |
-
----
+| Policy Category Key | Event Category Description | Associated Rule IDs / Groups | Default Email Status | 
+| ----- | ----- | ----- | ----- | 
+| `sftp_successful_transfers` | SFTP file upload/download attempt, transfer completed, delete/rename | `100502`, `100503`, `100504`, `100507` (`notify_sftp_transfer`) | **Enabled (`true`)** | 
+| `sftp_failed_denied_operations` | SFTP access denied (`sftp-denied` group) or file permission/transfer failure | `100505`, `100508` (`notify_sftp_denied`) | **Enabled (`true`)** | 
+| `ssh_bruteforce_detection` | SSH brute-force: 5 failures in 5m (**Medium**) & 10 failures in 5m (**High**) | `100601`, `100602` (Medium), `100611`, `100612` (High) (`notify_ssh_bruteforce`) | **Enabled (`true`)** | 
+| `sftp_connection_attempts` | SFTP session opened / closed (without file transfer) | `100501`, `100511` (`notify_sftp_connect`) | **Disabled (`false`)** *(Configurable)* | 
+| `ssh_authentication_events` | Individual SSH successful login (`5715`) or single failed password (`5716`) | `5715`, `5716`, `5710` (`notify_ssh_auth`) | **Disabled (`false`)** *(Configurable)* | 
+| `ssh_suspicious_login` | Multi-IP login (`100603`), username spraying (`100604`), login after brute-force (`100605`), root login (`100606`), external IP (`100608`), off-hours (`100609`) | `100603`–`100610` (`notify_ssh_suspicious`) | **Disabled (`false`)** *(Configurable)* | 
+| `linux_user_creation_deletion` | New Linux user created (`useradd`), modified (`usermod`), or deleted (`userdel`) | `5902`, `5903`, `5904`, `100630` (`notify_user_mgmt`) | **Disabled (`false`)** *(Configurable)* | 
+| `linux_group_changes` | Linux group created or membership modified (`gpasswd`, `usermod -aG`, `/etc/group`) | `5901`, `100631` (`notify_group_mgmt`) | **Disabled (`false`)** *(Configurable)* | 
+| `vnc_session_events` | TigerVNC authentication success, failure, or config change | `100506`, `100509`, `100510` (`notify_vnc`) | **Disabled (`false`)** *(Configurable)* | 
+| `file_integrity_monitoring` | Real-time Whodata FIM file changes (`550`, `553`, `554`) | `syscheck` (`notify_fim`) | **Disabled (`false`)** *(Configurable)* | 
+| `other_security_alerts` | Port changes (`100620`), firewall drops (`100623`), and other Wazuh alerts | `notify_other` | **Disabled (`false`)** *(Configurable)* | 
 
 ## 3. Complete Wazuh Server & Agent Installation from Scratch (Reference Baseline)
 
 *(If your Wazuh v4.14.9 Server and Agent are already installed and running, skip directly to **Section 4** to apply the audited fixes and upgrades.)*
 
 ### Step 1: Prepare RHEL 9.8 Server Prerequisites (Swap, Kernel Parameters, 100 GB Disk, Dependencies)
-* **Server:** Wazuh Manager (`wazuh-server` — `172.31.12.109`, RHEL 9.8)
 
-```bash
+* **Server:** Wazuh Manager (`wazuh-server` — `172.31.15.207`, RHEL 9.8)
+
+```
 # 1. Update OS packages and reboot if kernel was updated
 sudo dnf clean all && sudo dnf makecache
 sudo dnf upgrade -y
@@ -114,12 +134,14 @@ if systemctl is-active --quiet firewalld; then
     sudo firewall-cmd --permanent --add-port={443/tcp,1514/tcp,1515/tcp,55000/tcp}
     sudo firewall-cmd --reload
 fi
+
 ```
 
 ### Step 2: Install Wazuh v4.14.9 All-in-One Stack (Indexer, Manager, Filebeat, Dashboard)
-* **Server:** Wazuh Manager (`wazuh-server` — `172.31.12.109`, RHEL 9.8)
 
-```bash
+* **Server:** Wazuh Manager (`wazuh-server` — `172.31.15.207`, RHEL 9.8)
+
+```
 cd ~
 curl -sO https://packages.wazuh.com/4.14/wazuh-install.sh
 sudo bash ./wazuh-install.sh -a -i -v
@@ -129,18 +151,20 @@ sudo cp ~/wazuh-install-files.tar /root/wazuh-install-files-backup.tar
 sudo chmod 600 /root/wazuh-install-files-backup.tar
 sudo sed -i "s/^enabled=1/enabled=0/" /etc/yum.repos.d/wazuh.repo
 sudo systemctl status wazuh-indexer wazuh-manager filebeat wazuh-dashboard --no-pager
+
 ```
 
 ### Step 3: Install and Register Wazuh Agent v4.14.9 on Monitored Linux Server
-* **Server:** Wazuh Agent (`vnc-server` — `172.31.15.219`, RHEL 9.8)
 
-```bash
+* **Server:** Wazuh Agent (`vnc-server` — `172.31.15.62`, RHEL 9.8)
+
+```
 sudo dnf install -y audit curl coreutils
 sudo systemctl enable --now auditd
 
 sudo rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH
 curl -o wazuh-agent-4.14.9-1.x86_64.rpm https://packages.wazuh.com/4.x/yum/wazuh-agent-4.14.9-1.x86_64.rpm && \
-sudo WAZUH_MANAGER='172.31.12.109' WAZUH_AGENT_NAME='vnc-server' rpm -ihv wazuh-agent-4.14.9-1.x86_64.rpm
+sudo WAZUH_MANAGER='172.31.15.207' WAZUH_AGENT_NAME='vnc-server' rpm -ihv wazuh-agent-4.14.9-1.x86_64.rpm
 rm -f wazuh-agent-4.14.9-1.x86_64.rpm
 
 grep -q "logcollector.loop_timeout" /var/ossec/etc/local_internal_options.conf || \
@@ -148,26 +172,32 @@ echo "logcollector.loop_timeout=1" | sudo tee -a /var/ossec/etc/local_internal_o
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now wazuh-agent
-```
 
----
+```
 
 ## 4. Phase 1 of Fix: Universal SSH, SFTP & VNC Monitoring on the Wazuh Agent (`vnc-server`)
 
-Execute Steps 4, 5, and 6 on the **Monitored Linux Agent (`vnc-server` — `172.31.15.219`)** so that `ec2-user`, all existing users, and any newly created Linux or VNC users (`useradd newuser1`) are automatically monitored for SSH, SFTP, and VNC activity.
+Execute Steps 4, 5, and 6 on the **Monitored Linux Agent (`vnc-server` — `172.31.15.62`)** so that `ec2-user`, all existing users, and any newly created Linux or VNC users (`useradd newuser1`) are automatically monitored for SSH, SFTP, and VNC activity.
 
 ### Step 4: Back Up Agent Configurations and Fix Global OpenSSH / SFTP Logging
-* **Server:** Wazuh Agent (`vnc-server` — `172.31.15.219`, RHEL 9.8)
+
+* **Server:** Wazuh Agent (`vnc-server` — `172.31.15.62`, RHEL 9.8)
+
 * **Files Modified:** `/etc/ssh/sshd_config`, `/etc/ssh/sshd_config.d/50-sftp-monitoring.conf`
 
 #### Why This Fix Is Critical:
+
 By placing `LogLevel VERBOSE` and `Subsystem sftp internal-sftp -f AUTHPRIV -l INFO` at the top of `/etc/ssh/sshd_config.d/50-sftp-monitoring.conf` (before any `Match Group` blocks) and commenting out any other `Subsystem sftp` lines in `/etc/ssh/sshd_config*`, **every Linux user created now or in the future** automatically logs verbose SSH and SFTP file events (`open`, `close`, `remove`, `rename`, `Permission denied`) to `/var/log/secure`.
+
 * Users added to `sftp-denied` (`sudo usermod -aG sftp-denied <username>`) are blocked from SFTP and trigger `Rule 100505` (`[HIGH] SFTP Access Denied`).
+
 * Users added to `sftp-allowed` (`sudo usermod -aG sftp-allowed <username>`) are restricted to SFTP-only file transfers (no interactive SSH shell) with full `-l INFO` file logging.
+
 * Standard Linux users (like `ec2-user` or a new `useradd newuser1` not in `sftp-denied`) have normal SSH and SFTP access with full `-l INFO` file logging.
 
 #### Configuration (`/etc/ssh/sshd_config.d/50-sftp-monitoring.conf`):
-```text
+
+```
 # Global SSH & SFTP Verbose Auditing for ALL Linux Users (existing and newly created)
 LogLevel VERBOSE
 SyslogFacility AUTHPRIV
@@ -184,10 +214,12 @@ Match Group sftp-allowed
     ForceCommand internal-sftp -f AUTHPRIV -l INFO -u 0022
     AllowTcpForwarding no
     X11Forwarding no
+
 ```
 
 #### Commands:
-```bash
+
+```
 # 1. Back up existing SSH configurations
 sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
 [ -f /etc/ssh/sshd_config.d/50-sftp-monitoring.conf ] && \
@@ -227,25 +259,30 @@ EOF
 
 # 5. Validate SSHD configuration and reload
 sudo sshd -t && sudo systemctl reload sshd
+
 ```
 
 #### Validation:
-```bash
+
+```
 sudo sshd -T | grep -E "^loglevel|^syslogfacility|^subsystem"
 sudo sshd -T -C user=ec2-user | grep -E "^loglevel|^subsystem"
+
 ```
 
 #### Expected Result:
+
 Both commands output `loglevel VERBOSE`, `syslogfacility AUTHPRIV`, and `subsystem sftp internal-sftp -f AUTHPRIV -l INFO -u 0022`.
 
----
-
 ### Step 5: Configure Kernel `auditd` Rules for All Users, Account Management & VNC Changes
-* **Server:** Wazuh Agent (`vnc-server` — `172.31.15.219`, RHEL 9.8)
+
+* **Server:** Wazuh Agent (`vnc-server` — `172.31.15.62`, RHEL 9.8)
+
 * **File Modified:** `/etc/audit/rules.d/wazuh-full-monitoring.rules`
 
 #### Commands:
-```bash
+
+```
 # 1. Back up existing audit rules and pre-create watched directories
 [ -f /etc/audit/rules.d/wazuh-full-monitoring.rules ] && \
   sudo cp /etc/audit/rules.d/wazuh-full-monitoring.rules /etc/audit/rules.d/wazuh-full-monitoring.rules.bak
@@ -284,32 +321,37 @@ sudo tee /etc/audit/rules.d/wazuh-full-monitoring.rules << 'EOF'
 EOF
 
 sudo augenrules --load
+
 ```
 
 #### Validation:
-```bash
+
+```
 sudo auditctl -l
+
 ```
 
 #### Expected Result:
+
 Outputs all 15 kernel audit rules with zero errors.
 
----
-
 ### Step 6: Update Agent `/var/ossec/etc/ossec.conf` to Collect `/var/log/secure`, `/var/log/audit/audit.log`, and VNC Logs (`/home/*/.vnc/*.log`)
-* **Server:** Wazuh Agent (`vnc-server` — `172.31.15.219`, RHEL 9.8)
+
+* **Server:** Wazuh Agent (`vnc-server` — `172.31.15.62`, RHEL 9.8)
+
 * **File Modified:** `/var/ossec/etc/ossec.conf`
 
 *(Note: By removing duplicate `journald` collection of `sshd` events and collecting `/var/log/secure`, `/var/log/audit/audit.log`, `/var/log/messages`, and `/home/*/.vnc/*.log`, Wazuh Agent processes every SSH/SFTP event once without double-counting brute-force frequency counters!)*
 
 #### Commands:
-```bash
+
+```
 # 1. Back up existing Agent ossec.conf
 sudo cp /var/ossec/etc/ossec.conf /var/ossec/etc/ossec.conf.bak
 
-# 2. Write clean, complete Agent ossec.conf (automatically preserves 172.31.12.109 from existing config)
+# 2. Write clean, complete Agent ossec.conf (automatically preserves 172.31.15.207 from existing config)
 CURRENT_MANAGER_IP=$(sudo sed -n 's/.*<address>\(.*\)<\/address>.*/\1/p' /var/ossec/etc/ossec.conf.bak | head -n 1)
-[ -z "$CURRENT_MANAGER_IP" ] && CURRENT_MANAGER_IP="172.31.12.109"
+[ -z "$CURRENT_MANAGER_IP" ] && CURRENT_MANAGER_IP="172.31.15.207"
 
 sudo tee /var/ossec/etc/ossec.conf << EOF
 <ossec_config>
@@ -484,37 +526,48 @@ EOF
 sudo chown root:wazuh /var/ossec/etc/ossec.conf
 sudo chmod 660 /var/ossec/etc/ossec.conf
 sudo systemctl restart wazuh-agent
+
 ```
 
 #### Validation:
-```bash
+
+```
 sudo systemctl status wazuh-agent --no-pager
 sudo grep -E "Analyzing file.*secure|Analyzing file.*audit" /var/ossec/logs/ossec.log | tail -n 5
+
 ```
 
 #### Expected Result:
-`wazuh-agent` is `active (running)` and `ossec.log` confirms `/var/log/secure` and `/var/log/audit/audit.log` are being actively analyzed.
 
----
+`wazuh-agent` is `active (running)` and `ossec.log` confirms `/var/log/secure` and `/var/log/audit/audit.log` are being actively analyzed.
 
 ## 5. Phase 2 of Fix: Updated Custom Decoders & Multi-Tier Rules on Wazuh Manager (`wazuh-server`)
 
-Execute Steps 7, 8, and 9 on the **Wazuh Manager (`wazuh-server` — `172.31.12.109`)**.
+Execute Steps 7, 8, and 9 on the **Wazuh Manager (`wazuh-server` — `172.31.15.207`)**.
 
 ### Step 7: Update `/var/ossec/etc/decoders/sftp_decoders.xml` for All SFTP Operations, Blocked Users & VNC
-* **Server:** Wazuh Manager (`wazuh-server` — `172.31.12.109`, RHEL 9.8)
+
+* **Server:** Wazuh Manager (`wazuh-server` — `172.31.15.207`, RHEL 9.8)
+
 * **File Modified:** `/var/ossec/etc/decoders/sftp_decoders.xml`
 
 #### What This Decoder Update Adds:
+
 1. Decodes `session opened for local user <dstuser> from [<srcip>]` and `session closed for local user <dstuser>` under both `sshd` and `sftp-server`.
+
 2. Decodes `open "/home/<dstuser>/<file>" flags <extra_data>` AND `open "<file>" flags <extra_data>` so that whenever a file inside `/home/<username>/...` is uploaded or downloaded, **`dstuser` is extracted directly from the file path** even when OpenSSH omits the username on the `open` log line!
+
 3. Decodes `close "<file>" bytes read <status> written <extra_data>` to distinguish **SFTP Transfer Completed** from a mere file open attempt.
+
 4. Decodes `remove name "<file>"`, `rmdir name "<file>"`, and `rename old "<file>" new "<extra_data>"`.
+
 5. Decodes `Starting session: forced-command (config) '/usr/bin/false' for <dstuser> from <srcip> port <srcport>` when a restricted user in `sftp-denied` is blocked.
+
 6. Decodes `Xvnc` / TigerVNC authentication events.
 
 #### Configuration & Commands:
-```bash
+
+```
 # 1. Back up existing decoder file
 [ -f /var/ossec/etc/decoders/sftp_decoders.xml ] && \
   sudo cp /var/ossec/etc/decoders/sftp_decoders.xml /var/ossec/etc/decoders/sftp_decoders.xml.bak
@@ -653,40 +706,45 @@ EOF
 
 sudo chown wazuh:wazuh /var/ossec/etc/decoders/sftp_decoders.xml
 sudo chmod 660 /var/ossec/etc/decoders/sftp_decoders.xml
+
 ```
 
 #### Validation:
-```bash
+
+```
 sudo /var/ossec/bin/wazuh-analysisd -t
+
 ```
 
 #### Expected Result:
+
 `wazuh-analysisd -t` returns `0` with no errors.
 
----
-
 ### Step 8: Update `/var/ossec/etc/rules/sftp_and_vnc_rules.xml` (Separating SFTP Connection, Attempt, Completion, Denial & VNC)
-* **Server:** Wazuh Manager (`wazuh-server` — `172.31.12.109`, RHEL 9.8)
+
+* **Server:** Wazuh Manager (`wazuh-server` — `172.31.15.207`, RHEL 9.8)
+
 * **File Modified:** `/var/ossec/etc/rules/sftp_and_vnc_rules.xml`
 
 #### Complete SFTP & VNC Rule Matrix
 
-| Rule ID | Rule Name / Scenario | Level | Category Group Tag | Default Email |
-| :--- | :--- | :--- | :--- | :--- |
-| **100501** | SFTP Session Opened (Connection established, no file transferred yet) | `5` | `notify_sftp_connect` | **Disabled** |
-| **100511** | SFTP Session Closed | `3` | `notify_sftp_connect` | **Disabled** |
-| **100502** | SFTP File Upload Attempt (`open` with `WRITE`/`CREATE`/`TRUNCATE`/`APPEND`) | `8` | `notify_sftp_transfer` | **Enabled (Medium)** |
-| **100503** | SFTP File Download Detected (`open` with `READ`) | `8` | `notify_sftp_transfer` | **Enabled (Medium)** |
-| **100507** | SFTP File Upload/Download Transfer Completed (`close` with bytes written/read) | `8` | `notify_sftp_transfer` | **Enabled (Medium)** |
-| **100504** | SFTP File Deleted, Renamed, or Permission Modified (`remove`, `rmdir`, `rename`) | `10` | `notify_sftp_transfer` | **Enabled (Medium)** |
-| **100505** | SFTP Access Denied for Restricted User (`sftp-denied` group / `ForceCommand /usr/bin/false`) | `12` | `notify_sftp_denied` | **Enabled (High)** |
-| **100508** | SFTP File Transfer / Operation Failed (`sent status Permission denied` or `Failure`) | `11` | `notify_sftp_denied` | **Enabled (High)** |
-| **100506** | TigerVNC Configuration Modified (`audit.key: vnc-config-modify`) | `10` | `notify_vnc` | **Disabled** |
-| **100509** | TigerVNC Session Opened / User Authenticated | `5` | `notify_vnc` | **Disabled** |
-| **100510** | TigerVNC Authentication Failed | `8` | `notify_vnc` | **Disabled** |
+| Rule ID | Rule Name / Scenario | Level | Category Group Tag | Default Email | 
+| ----- | ----- | ----- | ----- | ----- | 
+| **100501** | SFTP Session Opened (Connection established, no file transferred yet) | `5` | `notify_sftp_connect` | **Disabled** | 
+| **100511** | SFTP Session Closed | `3` | `notify_sftp_connect` | **Disabled** | 
+| **100502** | SFTP File Upload Attempt (`open` with `WRITE`/`CREATE`/`TRUNCATE`/`APPEND`) | `8` | `notify_sftp_transfer` | **Enabled (Medium)** | 
+| **100503** | SFTP File Download Detected (`open` with `READ`) | `8` | `notify_sftp_transfer` | **Enabled (Medium)** | 
+| **100507** | SFTP File Upload/Download Transfer Completed (`close` with bytes written/read) | `8` | `notify_sftp_transfer` | **Enabled (Medium)** | 
+| **100504** | SFTP File Deleted, Renamed, or Permission Modified (`remove`, `rmdir`, `rename`) | `10` | `notify_sftp_transfer` | **Enabled (Medium)** | 
+| **100505** | SFTP Access Denied for Restricted User (`sftp-denied` group / `ForceCommand /usr/bin/false`) | `12` | `notify_sftp_denied` | **Enabled (High)** | 
+| **100508** | SFTP File Transfer / Operation Failed (`sent status Permission denied` or `Failure`) | `11` | `notify_sftp_denied` | **Enabled (High)** | 
+| **100506** | TigerVNC Configuration Modified (`audit.key: vnc-config-modify`) | `10` | `notify_vnc` | **Disabled** | 
+| **100509** | TigerVNC Session Opened / User Authenticated | `5` | `notify_vnc` | **Disabled** | 
+| **100510** | TigerVNC Authentication Failed | `8` | `notify_vnc` | **Disabled** | 
 
 #### Configuration & Commands:
-```bash
+
+```
 # 1. Back up existing SFTP/VNC rules file
 [ -f /var/ossec/etc/rules/sftp_and_vnc_rules.xml ] && \
   sudo cp /var/ossec/etc/rules/sftp_and_vnc_rules.xml /var/ossec/etc/rules/sftp_and_vnc_rules.xml.bak
@@ -776,20 +834,24 @@ EOF
 
 sudo chown wazuh:wazuh /var/ossec/etc/rules/sftp_and_vnc_rules.xml
 sudo chmod 660 /var/ossec/etc/rules/sftp_and_vnc_rules.xml
+
 ```
 
----
-
 ### Step 9: Update `/var/ossec/etc/rules/ssh_and_network_rules.xml` (5-Attempt Medium & 10-Attempt High Brute-Force + User/Group Management)
-* **Server:** Wazuh Manager (`wazuh-server` — `172.31.12.109`, RHEL 9.8)
+
+* **Server:** Wazuh Manager (`wazuh-server` — `172.31.15.207`, RHEL 9.8)
+
 * **File Modified:** `/var/ossec/etc/rules/ssh_and_network_rules.xml`
 
 #### How 5-Attempt (`[MEDIUM]`) and 10-Attempt (`[HIGH]`) Brute-Force Coexist Cleanly:
+
 * **Rules `100611` & `100612` (High Severity — Level 12, `frequency="10"`, `timeframe="300"`):** Placed **first** in the rule file so when the 10th failed SSH attempt within 5 minutes occurs (tracked by `<same_source_ip />` or `<same_user />`), Wazuh matches the High-Severity rule immediately.
+
 * **Rules `100601` & `100602` (Medium Severity — Level 8, `frequency="5"`, `timeframe="300"`):** Placed right below `100611`/`100612` and tagged with `<group>authentication_failed,...</group>` so event #5 triggers the Medium-Severity alert while still remaining part of the `authentication_failed` correlation group for events #6–#10!
 
 #### Configuration & Commands:
-```bash
+
+```
 # 1. Back up existing SSH/Network rules file
 [ -f /var/ossec/etc/rules/ssh_and_network_rules.xml ] && \
   sudo cp /var/ossec/etc/rules/ssh_and_network_rules.xml /var/ossec/etc/rules/ssh_and_network_rules.xml.bak
@@ -996,26 +1058,31 @@ EOF
 
 sudo chown wazuh:wazuh /var/ossec/etc/rules/ssh_and_network_rules.xml
 sudo chmod 660 /var/ossec/etc/rules/ssh_and_network_rules.xml
+
 ```
 
 #### Validation:
-```bash
+
+```
 sudo /var/ossec/bin/wazuh-analysisd -t
+
 ```
 
 #### Expected Result:
-`wazuh-analysisd -t` returns `0` with no errors.
 
----
+`wazuh-analysisd -t` returns `0` with no errors.
 
 ## 6. Phase 3 of Fix: Configurable Notification Policy & Redesigned 6-Section HTML Email Engine
 
 ### Step 10: Create the Centralized Email Notification Policy File (`/var/ossec/etc/email_notification_policy.json`)
-* **Server:** Wazuh Manager (`wazuh-server` — `172.31.12.109`, RHEL 9.8)
+
+* **Server:** Wazuh Manager (`wazuh-server` — `172.31.15.207`, RHEL 9.8)
+
 * **File Created:** `/var/ossec/etc/email_notification_policy.json`
 
 #### Configuration & Commands:
-```bash
+
+```
 sudo tee /var/ossec/etc/email_notification_policy.json << 'EOF'
 {
   "categories": {
@@ -1037,12 +1104,14 @@ EOF
 
 sudo chown root:wazuh /var/ossec/etc/email_notification_policy.json
 sudo chmod 660 /var/ossec/etc/email_notification_policy.json
+
 ```
 
 #### How to Enable or Disable Any Email Category Later (Without Restarting Wazuh):
+
 Because `/var/ossec/integrations/custom-html-email.py` reads `/var/ossec/etc/email_notification_policy.json` dynamically on every alert, you can toggle any category on or off immediately without restarting `wazuh-manager`:
 
-```bash
+```
 # Example 1: Enable emails for SSH Suspicious Logins (Multi-IP, Root login, Login after brute-force)
 sudo /var/ossec/framework/python/bin/python3 -c '
 import json
@@ -1069,28 +1138,40 @@ data = json.load(open(p))
 data["categories"]["sftp_connection_attempts"] = False
 json.dump(data, open(p, "w"), indent=2)
 '
+
 ```
 
----
-
 ### Step 11: Deploy the Redesigned 6-Section HTML Email Integration (`/var/ossec/integrations/custom-html-email.py`)
-* **Server:** Wazuh Manager (`wazuh-server` — `172.31.12.109`, RHEL 9.8)
+
+* **Server:** Wazuh Manager (`wazuh-server` — `172.31.15.207`, RHEL 9.8)
+
 * **File Modified:** `/var/ossec/integrations/custom-html-email.py`
 
 #### Key Capabilities of This Upgraded Integration Script:
+
 1. **Automatic PID Session Cache (`/var/ossec/tmp/sftp_session_cache.json`):** Whenever any user (`ec2-user`, `newuser1`, `eng-001`, etc.) opens an SSH/SFTP session (`Rule 5715` or `100501`), the script caches `(agent_id, pid) -> {username, srcip}` and also caches the most recent file opened by that PID. When subsequent `open`, `close`, `remove`, or `sent status Permission denied` lines arrive for that same `sshd[PID]`, the script automatically populates the **Username**, **Source IP**, **File Name**, and **Full File Path**!
+
 2. **Deduplication Guard:** Prevents duplicate `[MEDIUM]` emails on failed attempts #6, #7, #8, and #9 after attempt #5 has already sent the Medium alert, while allowing attempt #10 (`Rule 100611`/`100612`) to send the `[HIGH] SSH Brute-Force Attack Detected` email immediately.
+
 3. **Standardized 6-Section Executive Layout:**
+
    * **Header:** `Security Incident Notification • MEDIUM/HIGH Severity` + Clear Incident Name below header.
+
    * **Section 1:** Incident Summary (Plain English)
+
    * **Section 2:** Affected Server (Hostname, Server IP, Agent Name, Agent ID, OS)
+
    * **Section 3:** User Information (Username, UID if available, Group if available, Access Method: `SSH` / `SFTP` / `VNC`, Authentication Status)
+
    * **Section 4:** Activity Details (Tailored specifically for SSH events vs. SFTP events; only displays fields present in the event—never invents missing values)
+
    * **Section 5:** Security Explanation
+
    * **Section 6:** Recommended Actions (No raw JSON dumps or technical clutter)
 
 #### Commands:
-```bash
+
+```
 # 1. Back up existing integration script (if present) and extract your existing sender/recipient emails
 if [ -f /var/ossec/integrations/custom-html-email.py ]; then
   sudo cp /var/ossec/integrations/custom-html-email.py /var/ossec/integrations/custom-html-email.py.bak
@@ -1791,28 +1872,34 @@ sudo chmod 750 /var/ossec/integrations/custom-html-email.py
 sudo mkdir -p /var/ossec/tmp
 sudo chown root:wazuh /var/ossec/tmp
 sudo chmod 770 /var/ossec/tmp
+
 ```
 
 #### Validation:
-```bash
+
+```
 sudo /var/ossec/framework/python/bin/python3 -m py_compile /var/ossec/integrations/custom-html-email.py
 sudo grep -E "SENDER_EMAIL =|RECIPIENT_EMAILS =" /var/ossec/integrations/custom-html-email.py
+
 ```
 
 #### Expected Result:
+
 `py_compile` completes with zero syntax errors, and `grep` shows your configured sender and recipient email addresses.
 
----
-
 ### Step 12: Update Wazuh Manager `/var/ossec/etc/ossec.conf` Integration Hook & Restart `wazuh-manager`
-* **Server:** Wazuh Manager (`wazuh-server` — `172.31.12.109`, RHEL 9.8)
+
+* **Server:** Wazuh Manager (`wazuh-server` — `172.31.15.207`, RHEL 9.8)
+
 * **File Modified:** `/var/ossec/etc/ossec.conf`
 
 #### Why We Include `authentication_success` in the Integration Group:
+
 By passing `authentication_success,notify_sftp_connect,notify_sftp_transfer,notify_sftp_denied,notify_ssh_bruteforce,notify_ssh_suspicious,notify_user_mgmt,notify_group_mgmt,notify_vnc,notify_other` to `custom-html-email.py`, the script silently records every new SSH/SFTP user login PID into `/var/ossec/tmp/sftp_session_cache.json` (and exits without emailing if `ssh_authentication_events` and `sftp_connection_attempts` are `false`), guaranteeing that subsequent file upload/download/denied events know the exact username and source IP!
 
 #### Commands:
-```bash
+
+```
 # 1. Back up Manager ossec.conf
 sudo cp /var/ossec/etc/ossec.conf /var/ossec/etc/ossec.conf.bak
 
@@ -1826,256 +1913,354 @@ sudo sed -i '0,/<\/ossec_config>/s|<\/ossec_config>|  <integration>\n    <name>c
 
 # 4. Validate configuration and restart wazuh-manager
 sudo /var/ossec/bin/wazuh-analysisd -t && sudo systemctl restart wazuh-manager
+
 ```
 
 #### Validation:
-```bash
+
+```
 sudo systemctl status wazuh-manager --no-pager
 ps aux | grep wazuh-integratord
+
 ```
 
 #### Expected Result:
-`wazuh-manager` is `active (running)` and `wazuh-integratord` is active.
 
----
+`wazuh-manager` is `active (running)` and `wazuh-integratord` is active.
 
 ## 7. Phase 4: Realistic Manual End-to-End Testing & Validation (13 Test Scenarios)
 
-Perform all tests from an **authorized Linux testing machine (`<TEST_CLIENT_IP_1>`)** against the **Monitored Wazuh Agent (`vnc-server` at `172.31.15.219`)** using real SSH, SFTP, and VNC connections.
+Perform all tests from an **authorized Linux testing machine (`<TEST_CLIENT_IP_1>`)** against the **Monitored Wazuh Agent (`vnc-server` at `172.31.15.62`)** using real SSH, SFTP, and VNC connections.
 
 ### Test 1: SSH Login with an Existing User (`ec2-user`)
+
 * **Command (on Test Machine):**
-  ```bash
-  ssh ec2-user@172.31.15.219
-  # Authenticate normally, then type 'exit'
+
   ```
-* **Expected Result:**
-  * **Triggered Rule:** `5715` (Level 3 — `sshd: authentication success.`)
-  * **Dashboard Visibility:** Logged in Wazuh Dashboard with `data.dstuser: ec2-user` and `data.srcip`.
-  * **Email Action:** **Suppressed** (`ssh_authentication_events: false`). Session PID is cached for SFTP correlation.
-* **Verification on Wazuh Manager:**
-  ```bash
-  sudo grep '"id":"5715"' /var/ossec/logs/alerts/alerts.json | grep "ec2-user" | tail -n 1
+  ssh ec2-user@172.31.15.62
+  # Authenticate normally, then type 'exit'
+  
   ```
 
----
+* **Expected Result:**
+
+  * **Triggered Rule:** `5715` (Level 3 — `sshd: authentication success.`)
+
+  * **Dashboard Visibility:** Logged in Wazuh Dashboard with `data.dstuser: ec2-user` and `data.srcip`.
+
+  * **Email Action:** **Suppressed** (`ssh_authentication_events: false`). Session PID is cached for SFTP correlation.
+
+* **Verification on Wazuh Manager:**
+
+  ```
+  sudo grep '"id":"5715"' /var/ossec/logs/alerts/alerts.json | grep "ec2-user" | tail -n 1
+  
+  ```
 
 ### Test 2: Creation of New Linux Users (`newuser1`, `newuser2`) & Automatic SSH Login Monitoring
+
 * **Command (on Monitored Agent `vnc-server`):**
-  ```bash
+
+  ```
   sudo useradd newuser1
   sudo passwd newuser1
   sudo useradd newuser2
   sudo passwd newuser2
+  
   ```
+
 * **Command (on Test Machine — No Wazuh Config Changes Made):**
-  ```bash
-  ssh newuser1@172.31.15.219
-  # Enter newuser1's password, then type 'exit'
+
   ```
+  ssh newuser1@172.31.15.62
+  # Enter newuser1's password, then type 'exit'
+  
+  ```
+
 * **Expected Result:**
+
   * **User Creation Rules Triggered:** `5902` (`New user added to the system`) and `100630` (`Linux User Account Database Modified`).
+
   * **SSH Login Rule Triggered:** `5715` (`data.dstuser: newuser1`).
+
   * **Email Action:** **Suppressed** by default (`linux_user_creation_deletion: false`, `ssh_authentication_events: false`).
+
 * **Verification on Wazuh Manager:**
-  ```bash
+
+  ```
   sudo grep -E '"id":"5902"|"id":"100630"' /var/ossec/logs/alerts/alerts.json | tail -n 2
   sudo grep '"id":"5715"' /var/ossec/logs/alerts/alerts.json | grep "newuser1" | tail -n 1
+  
   ```
-
----
 
 ### Test 3: Five Incorrect SSH Passwords Within 5 Minutes (Medium Brute-Force — Rule `100601` / `100602`)
+
 * **Command (on Test Machine):**
-  ```bash
-  ssh -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 newuser1@172.31.15.219
-  # Enter an intentionally wrong password. Repeat this command 5 times total within 5 minutes.
+
   ```
+  ssh -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 newuser1@172.31.15.62
+  # Enter an intentionally wrong password. Repeat this command 5 times total within 5 minutes.
+  
+  ```
+
 * **Expected Result:**
+
   * **Attempts 1–4:** Trigger Rule `5716` (Level 5) — **No email sent**.
+
   * **Attempt 5:** Triggers **Rule `100601` / `100602` (Level 8)**.
+
   * **Email Action:** **1 Email Sent** with subject `[MEDIUM] SSH Brute-Force Activity Detected | vnc-server`, showing `newuser1`, source IP, and `5 failed attempts within 5 minutes`.
+
 * **Verification on Wazuh Manager:**
-  ```bash
+
+  ```
   sudo grep -E '"id":"100601"|"id":"100602"' /var/ossec/logs/alerts/alerts.json | tail -n 2
   sudo tail -n 15 /var/log/maillog
+  
   ```
-
----
 
 ### Test 4: Ten Incorrect SSH Passwords Within 5 Minutes (High Brute-Force — Rule `100611` / `100612`)
+
 * **Command (on Test Machine — Continue from Test 3 with 5 more wrong passwords within the same 5-minute window):**
-  ```bash
-  ssh -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 newuser1@172.31.15.219
-  # Enter an intentionally wrong password 5 more times (attempts #6 through #10).
+
   ```
+  ssh -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 newuser1@172.31.15.62
+  # Enter an intentionally wrong password 5 more times (attempts #6 through #10).
+  
+  ```
+
 * **Expected Result:**
+
   * **Attempts 6–9:** Deduplicated — **No duplicate Medium emails sent**.
+
   * **Attempt 10:** Triggers **Rule `100611` / `100612` (Level 12)**.
+
   * **Email Action:** **1 Email Sent** with subject `[HIGH] SSH Brute-Force Attack Detected | vnc-server`, showing `newuser1`, source IP, and `10 failed attempts within 5 minutes`.
+
 * **Verification on Wazuh Manager:**
-  ```bash
+
+  ```
   sudo grep -E '"id":"100611"|"id":"100612"' /var/ossec/logs/alerts/alerts.json | tail -n 2
   sudo tail -n 15 /var/log/maillog
+  
   ```
-
----
 
 ### Test 5: Successful SSH Login After Repeated Failures (Rule `100605`)
+
 * **Command (on Test Machine — Immediately after Test 4):**
-  ```bash
-  ssh newuser1@172.31.15.219
-  # Enter the CORRECT password for newuser1, then type 'exit'
+
   ```
-* **Expected Result:**
-  * **Triggered Rule:** **Rule `100605` (Level 14)** — `CRITICAL: Successful SSH login by user newuser1... immediately following an SSH brute-force attack`.
-  * **Email Action:** Logged in Dashboard; email sent if `ssh_suspicious_login` is set to `true` in `email_notification_policy.json`.
-* **Verification on Wazuh Manager:**
-  ```bash
-  sudo grep '"id":"100605"' /var/ossec/logs/alerts/alerts.json | tail -n 1
+  ssh newuser1@172.31.15.62
+  # Enter the CORRECT password for newuser1, then type 'exit'
+  
   ```
 
----
+* **Expected Result:**
+
+  * **Triggered Rule:** **Rule `100605` (Level 14)** — `CRITICAL: Successful SSH login by user newuser1... immediately following an SSH brute-force attack`.
+
+  * **Email Action:** Logged in Dashboard; email sent if `ssh_suspicious_login` is set to `true` in `email_notification_policy.json`.
+
+* **Verification on Wazuh Manager:**
+
+  ```
+  sudo grep '"id":"100605"' /var/ossec/logs/alerts/alerts.json | tail -n 1
+  
+  ```
 
 ### Test 6: SFTP Connection Using `ec2-user` (Connection Only, No File Transfer)
+
 * **Command (on Test Machine):**
-  ```bash
-  sftp ec2-user@172.31.15.219
+
+  ```
+  sftp ec2-user@172.31.15.62
   sftp> ls
   sftp> exit
-  ```
-* **Expected Result:**
-  * **Triggered Rules:** `100501` (SFTP Session Opened) and `100511` (SFTP Session Closed).
-  * **Email Action:** **Suppressed** (`sftp_connection_attempts: false`), preventing false "file transferred" emails when a user only connects.
-* **Verification on Wazuh Manager:**
-  ```bash
-  sudo grep '"id":"100501"' /var/ossec/logs/alerts/alerts.json | grep "ec2-user" | tail -n 1
+  
   ```
 
----
+* **Expected Result:**
+
+  * **Triggered Rules:** `100501` (SFTP Session Opened) and `100511` (SFTP Session Closed).
+
+  * **Email Action:** **Suppressed** (`sftp_connection_attempts: false`), preventing false "file transferred" emails when a user only connects.
+
+* **Verification on Wazuh Manager:**
+
+  ```
+  sudo grep '"id":"100501"' /var/ossec/logs/alerts/alerts.json | grep "ec2-user" | tail -n 1
+  
+  ```
 
 ### Test 7: SFTP Connection Using Newly Created Linux User (`newuser1`)
+
 * **Command (on Test Machine):**
-  ```bash
-  sftp newuser1@172.31.15.219
+
+  ```
+  sftp newuser1@172.31.15.62
   # Enter newuser1's password
   sftp> pwd
   sftp> exit
-  ```
-* **Expected Result:**
-  * **Triggered Rules:** `100501` (`data.dstuser: newuser1`, `data.srcip: <TEST_CLIENT_IP_1>`) and `100511`.
-  * **Email Action:** **Suppressed** (`sftp_connection_attempts: false`).
-* **Verification on Wazuh Manager:**
-  ```bash
-  sudo grep '"id":"100501"' /var/ossec/logs/alerts/alerts.json | grep "newuser1" | tail -n 1
+  
   ```
 
----
+* **Expected Result:**
+
+  * **Triggered Rules:** `100501` (`data.dstuser: newuser1`, `data.srcip: <TEST_CLIENT_IP_1>`) and `100511`.
+
+  * **Email Action:** **Suppressed** (`sftp_connection_attempts: false`).
+
+* **Verification on Wazuh Manager:**
+
+  ```
+  sudo grep '"id":"100501"' /var/ossec/logs/alerts/alerts.json | grep "newuser1" | tail -n 1
+  
+  ```
 
 ### Test 8: Successful SFTP File Upload by Newly Created User (`newuser1` — Rules `100502` & `100507`)
+
 * **Command (on Test Machine):**
-  ```bash
+
+  ```
   echo "Semiconductor GDS layout verification payload" > chip_test_v1.gds
-  sftp newuser1@172.31.15.219
+  sftp newuser1@172.31.15.62
   sftp> put chip_test_v1.gds
   sftp> exit
+  
   ```
+
 * **Expected Result:**
+
   * **Triggered Rules:**
+
     * `100502` (Level 8 — Upload Attempt: `open "/home/newuser1/chip_test_v1.gds" flags WRITE,CREATE,TRUNCATE`)
+
     * `100507` (Level 8 — Transfer Completed: `close "/home/newuser1/chip_test_v1.gds" bytes read 0 written 46`)
+
   * **Email Action:** **Enabled (`sftp_successful_transfers: true`)**. Sends formatted HTML email with subject `[MEDIUM] SFTP File Transfer Detected | vnc-server` and `[MEDIUM] SFTP File Transfer Completed | vnc-server` displaying Username `newuser1`, Source IP, File Name `chip_test_v1.gds`, Full Path `/home/newuser1/chip_test_v1.gds`, and Operation `Upload`.
+
 * **Verification on Wazuh Manager:**
-  ```bash
+
+  ```
   sudo grep -E '"id":"100502"|"id":"100507"' /var/ossec/logs/alerts/alerts.json | tail -n 2
   sudo tail -n 15 /var/log/maillog
+  
   ```
-
----
 
 ### Test 9: SFTP File Download by Newly Created User (`newuser1` — Rule `100503`)
+
 * **Command (on Test Machine):**
-  ```bash
-  sftp newuser1@172.31.15.219
+
+  ```
+  sftp newuser1@172.31.15.62
   sftp> get chip_test_v1.gds downloaded_chip.gds
   sftp> exit
-  ```
-* **Expected Result:**
-  * **Triggered Rule:** `100503` (Level 8 — `SFTP File Transfer Detected (Download)`) and `100507` (Transfer Completed).
-  * **Email Action:** **Enabled**. Sends HTML email `[MEDIUM] SFTP File Transfer Detected | vnc-server` showing `newuser1`, `chip_test_v1.gds`, and `Download (Read)`.
-* **Verification on Wazuh Manager:**
-  ```bash
-  sudo grep '"id":"100503"' /var/ossec/logs/alerts/alerts.json | tail -n 1
+  
   ```
 
----
+* **Expected Result:**
+
+  * **Triggered Rule:** `100503` (Level 8 — `SFTP File Transfer Detected (Download)`) and `100507` (Transfer Completed).
+
+  * **Email Action:** **Enabled**. Sends HTML email `[MEDIUM] SFTP File Transfer Detected | vnc-server` showing `newuser1`, `chip_test_v1.gds`, and `Download (Read)`.
+
+* **Verification on Wazuh Manager:**
+
+  ```
+  sudo grep '"id":"100503"' /var/ossec/logs/alerts/alerts.json | tail -n 1
+  
+  ```
 
 ### Test 10: SFTP Access Denied for a Restricted User (`newuser2` in `sftp-denied` — Rule `100505`)
+
 * **Command (on Monitored Agent `vnc-server`):**
-  ```bash
+
+  ```
   sudo usermod -aG sftp-denied newuser2
+  
   ```
+
 * **Command (on Test Machine):**
-  ```bash
-  sftp newuser2@172.31.15.219
-  # Enter newuser2's password -> Connection immediately closes
+
   ```
+  sftp newuser2@172.31.15.62
+  # Enter newuser2's password -> Connection immediately closes
+  
+  ```
+
 * **Expected Result:**
+
   * **Triggered Rule:** **Rule `100505` (Level 12)** — `SFTP Access Denied: Restricted user newuser2 from IP <TEST_CLIENT_IP_1> attempted SFTP access`.
+
   * **Email Action:** **Enabled (`sftp_failed_denied_operations: true`)**. Sends HTML email with subject `[HIGH] SFTP Access Denied | vnc-server`, showing Username `newuser2`, User Group `sftp-denied`, Access Method `SFTP`, and Transfer Result `Denied / Blocked by Server Policy`.
+
 * **Verification on Wazuh Manager:**
-  ```bash
+
+  ```
   sudo grep '"id":"100505"' /var/ossec/logs/alerts/alerts.json | tail -n 1
   sudo tail -n 15 /var/log/maillog
+  
   ```
 
----
-
 ### Test 11: SFTP File Transfer Attempt That Fails Due to Permission Denied (Rule `100508`)
+
 * **Command (on Test Machine using `newuser1`):**
-  ```bash
-  sftp newuser1@172.31.15.219
+
+  ```
+  sftp newuser1@172.31.15.62
   sftp> put chip_test_v1.gds /etc/unauthorized_chip.gds
   # Outputs: remote open("/etc/unauthorized_chip.gds"): Permission denied
   sftp> exit
-  ```
-* **Expected Result:**
-  * **Triggered Rule:** **Rule `100508` (Level 11)** — `SFTP File Operation Failed/Denied: SFTP server returned error status`.
-  * **Email Action:** **Enabled (`sftp_failed_denied_operations: true`)**. Sends HTML email with subject `[HIGH] SFTP File Transfer Failed or Denied | vnc-server` showing `newuser1`, source IP, and `Failed (Permission Denied / Error)`.
-* **Verification on Wazuh Manager:**
-  ```bash
-  sudo grep '"id":"100508"' /var/ossec/logs/alerts/alerts.json | tail -n 1
+  
   ```
 
----
+* **Expected Result:**
+
+  * **Triggered Rule:** **Rule `100508` (Level 11)** — `SFTP File Operation Failed/Denied: SFTP server returned error status`.
+
+  * **Email Action:** **Enabled (`sftp_failed_denied_operations: true`)**. Sends HTML email with subject `[HIGH] SFTP File Transfer Failed or Denied | vnc-server` showing `newuser1`, source IP, and `Failed (Permission Denied / Error)`.
+
+* **Verification on Wazuh Manager:**
+
+  ```
+  sudo grep '"id":"100508"' /var/ossec/logs/alerts/alerts.json | tail -n 1
+  
+  ```
 
 ### Test 12: VNC Login Using a VNC-Enabled Linux User (Rules `100509` & `100510`)
-* **Command:** Connect to `vnc-server` (`172.31.15.219:5901`) using TigerVNC Viewer with a configured VNC user (first with an incorrect password, then with the correct password).
-* **Expected Result:**
-  * **Triggered Rules:** `100510` (Level 8 — `VNC Authentication Failed`) and `100509` (Level 5 — `VNC Session Opened`).
-  * **Email Action:** Logged in Wazuh Dashboard; email suppressed by default (`vnc_session_events: false`) and configurable via `email_notification_policy.json`.
-* **Verification on Wazuh Manager:**
-  ```bash
-  sudo grep -E '"id":"100509"|"id":"100510"' /var/ossec/logs/alerts/alerts.json | tail -n 2
-  ```
 
----
+* **Command:** Connect to `vnc-server` (`172.31.15.62:5901`) using TigerVNC Viewer with a configured VNC user (first with an incorrect password, then with the correct password).
+
+* **Expected Result:**
+
+  * **Triggered Rules:** `100510` (Level 8 — `VNC Authentication Failed`) and `100509` (Level 5 — `VNC Session Opened`).
+
+  * **Email Action:** Logged in Wazuh Dashboard; email suppressed by default (`vnc_session_events: false`) and configurable via `email_notification_policy.json`.
+
+* **Verification on Wazuh Manager:**
+
+  ```
+  sudo grep -E '"id":"100509"|"id":"100510"' /var/ossec/logs/alerts/alerts.json | tail -n 2
+  
+  ```
 
 ### Test 13: Cleanup of Test Users After Validation
+
 * **Command (on Monitored Agent `vnc-server`):**
-  ```bash
+
+  ```
   sudo userdel -r newuser1
   sudo userdel -r newuser2
+  
   ```
-
----
 
 ## 8. Rollback Instructions
 
 If you ever need to revert any change to its pre-audit state, run the following commands on the respective server:
 
 ### 8.1 Rollback on Wazuh Agent (`vnc-server`)
-```bash
+
+```
 sudo cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
 sudo cp /etc/ssh/sshd_config.d/50-sftp-monitoring.conf.bak /etc/ssh/sshd_config.d/50-sftp-monitoring.conf
 sudo sshd -t && sudo systemctl reload sshd
@@ -2085,10 +2270,12 @@ sudo augenrules --load
 
 sudo cp /var/ossec/etc/ossec.conf.bak /var/ossec/etc/ossec.conf
 sudo systemctl restart wazuh-agent
+
 ```
 
 ### 8.2 Rollback on Wazuh Manager (`wazuh-server`)
-```bash
+
+```
 sudo cp /var/ossec/etc/decoders/sftp_decoders.xml.bak /var/ossec/etc/decoders/sftp_decoders.xml
 sudo cp /var/ossec/etc/rules/sftp_and_vnc_rules.xml.bak /var/ossec/etc/rules/sftp_and_vnc_rules.xml
 sudo cp /var/ossec/etc/rules/ssh_and_network_rules.xml.bak /var/ossec/etc/rules/ssh_and_network_rules.xml
@@ -2096,4 +2283,5 @@ sudo cp /var/ossec/integrations/custom-html-email.py.bak /var/ossec/integrations
 sudo cp /var/ossec/etc/ossec.conf.bak /var/ossec/etc/ossec.conf
 
 sudo /var/ossec/bin/wazuh-analysisd -t && sudo systemctl restart wazuh-manager
+
 ```
