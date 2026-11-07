@@ -1883,6 +1883,39 @@ sudo grep -E "SENDER_EMAIL =|RECIPIENT_EMAILS =" /var/ossec/integrations/custom-
 
 ```
 
+#### Setup Smtp:
+```
+# 1. Install Postfix, SASL authentication modules, and s-nail mail utility
+sudo dnf install -y postfix cyrus-sasl cyrus-sasl-plain s-nail
+sudo systemctl enable --now postfix
+
+# 2. Create and hash the SASL password map
+sudo tee /etc/postfix/sasl_passwd << 'EOF'
+[smtp.gmail.com]:587 devops.jakir@gmail.com:<YOU_EMAIL_APP_PASSWORD>
+EOF
+sudo chmod 600 /etc/postfix/sasl_passwd
+sudo postmap /etc/postfix/sasl_passwd
+
+# 3. Comment out default smtp_tls_security_level=may and force IPv4 to eliminate Gmail IPv6 timeouts
+sudo sed -i 's/^smtp_tls_security_level = may/#smtp_tls_security_level = may/' /etc/postfix/main.cf
+sudo postconf -e "inet_protocols = ipv4"
+
+# 4. Append Gmail STARTTLS relay configuration if not already present
+grep -q "relayhost = \[smtp.gmail.com\]:587" /etc/postfix/main.cf || sudo tee -a /etc/postfix/main.cf << 'EOF'
+
+# Gmail SMTP Relay Configuration
+relayhost = [smtp.gmail.com]:587
+smtp_use_tls = yes
+smtp_sasl_auth_enable = yes
+smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd
+smtp_sasl_security_options = noanonymous
+smtp_tls_security_level = encrypt
+smtp_tls_cafile = /etc/ssl/certs/ca-bundle.crt
+EOF
+
+sudo systemctl restart postfix
+```
+
 #### Expected Result:
 
 `py_compile` completes with zero syntax errors, and `grep` shows your configured sender and recipient email addresses.
